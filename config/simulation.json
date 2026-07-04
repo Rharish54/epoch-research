@@ -1,0 +1,8 @@
+{
+    "sources": 4,
+    "events": 1000,
+    "seed": 42,
+    "drift_ppm": 100.0,
+    "max_offset_us": 500.0,
+    "noise_std_ns": 50.0
+}
