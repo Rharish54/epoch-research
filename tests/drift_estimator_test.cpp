@@ -157,6 +157,52 @@ TEST(DriftEstimator, DoesNotExtrapolateSlopeBeyondObservedWindow) {
     EXPECT_NEAR(far_value, value_at_last_sample, 1.0);
 }
 
+TEST(DriftEstimator, UncertaintyIsNonNegative) {
+    DriftAwareOffsetEstimator est;
+    for (int i = 0; i < 6; ++i) {
+        const NsTimestamp t = kRefTime + i * 100'000;
+        est.add_sample(make_sample(t, /*offset=*/1000 + i * 10, /*rtt=*/40'000));
+    }
+    const auto est_result = est.estimate_with_uncertainty_at(kRefTime + 5 * 100'000);
+    ASSERT_TRUE(est_result.has_value());
+    EXPECT_GE(est_result->uncertainty, 0);
+}
+
+TEST(DriftEstimator, UncertaintyIsAtLeastHalfMedianRttEvenWithPerfectFit) {
+    // Zero-noise linear samples -> residual term is ~0, so uncertainty
+    // should be bounded below by the RTT/2 term rather than collapsing to 0.
+    DriftAwareOffsetEstimator est;
+    constexpr NsDuration kRtt = 80'000;
+    for (int i = 0; i < 6; ++i) {
+        const NsTimestamp t = kRefTime + i * 100'000;
+        const NsDuration offset = 1000 + 2 * (t - kRefTime);
+        est.add_sample(make_sample(t, offset, kRtt));
+    }
+    const auto est_result = est.estimate_with_uncertainty_at(kRefTime + 5 * 100'000);
+    ASSERT_TRUE(est_result.has_value());
+    EXPECT_GE(est_result->uncertainty, kRtt / 2);
+}
+
+TEST(DriftEstimator, NoisierWindowProducesWiderUncertaintyThanCleanWindow) {
+    DriftAwareOffsetEstimator clean_est;
+    DriftAwareOffsetEstimator noisy_est;
+    // Small RTT so the RTT/2 floor doesn't swamp the residual-based term --
+    // the point of this test is to isolate the residual contribution.
+    constexpr NsDuration kRtt = 2'000;
+    const std::vector<NsDuration> scatter = {8000, -8000, 8000, -8000, 8000, -8000};
+    for (int i = 0; i < 6; ++i) {
+        const NsTimestamp t = kRefTime + i * 100'000;
+        const NsDuration base_offset = 1000 + i * 100'000;
+        clean_est.add_sample(make_sample(t, base_offset, kRtt));
+        noisy_est.add_sample(make_sample(t, base_offset + scatter[static_cast<std::size_t>(i)], kRtt));
+    }
+    const auto clean_result = clean_est.estimate_with_uncertainty_at(kRefTime + 5 * 100'000);
+    const auto noisy_result = noisy_est.estimate_with_uncertainty_at(kRefTime + 5 * 100'000);
+    ASSERT_TRUE(clean_result.has_value());
+    ASSERT_TRUE(noisy_result.has_value());
+    EXPECT_GT(noisy_result->uncertainty, clean_result->uncertainty);
+}
+
 TEST(DriftEstimator, LowerRttSampleWeightedMoreHeavily) {
     // Two samples at the same x (same key), very different offsets and RTTs.
     // The fit's weighted mean should sit closer to the low-RTT sample.

@@ -47,6 +47,7 @@ add_library(chronos_lib STATIC
     src/network/latency_model.cpp
     src/metrics/accuracy.cpp
     src/metrics/percentile.cpp
+    src/metrics/ambiguity.cpp
 )
 target_include_directories(chronos_lib PUBLIC include)
 
@@ -66,6 +67,8 @@ add_executable(chronos_tests
     tests/offset_estimator_test.cpp
     tests/drift_estimator_test.cpp
     tests/percentile_test.cpp
+    tests/interval_order_test.cpp
+    tests/ambiguity_test.cpp
 )
 target_link_libraries(chronos_tests PRIVATE
     chronos_lib

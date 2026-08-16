@@ -1,0 +1,48 @@
+
+Chronos Phase 4 — Simulation Report
+-------------------------------------
+Sources:                 16
+Events generated:        5000
+Seed:                    42
+Drift (PPM):             ±300
+Max offset (us):         ±2000
+Noise std (ns):          500
+Sync interval (us):      200
+Base latency (us):       100
+Drift window (samples):  10
+Outlier RTT multiplier:  3
+
+Raw timestamp ordering accuracy:      71.35%
+  (sampled 1999594 of 12497500 pairs -- exact computation would be O(n^2))
+Naive-corrected ordering accuracy:    89.67%
+  (sampled 1999594 of 12497500 pairs -- exact computation would be O(n^2))
+Weighted-corrected ordering accuracy: 91.77%
+  (sampled 1999594 of 12497500 pairs -- exact computation would be O(n^2))
+Improvement (raw -> naive):            18.32 pp
+Improvement (naive -> weighted):       2.10 pp
+
+Naive correction error    -- median / p95 / p99: 56160.00 / 272243.00 / 578724.00 ns
+Weighted correction error -- median / p95 / p99: 1098.00 / 137915.00 / 173294.00 ns
+
+
+Confidence-interval classification (weighted-corrected events):
+  Definite pairs:   1824540 (91.25%), correct: 1678227 (91.98%)
+  Ambiguous pairs:  175054 (8.75%)
+  Point-estimate errors: 164618, caught by ambiguity flag: 18305 (11.12%)
+  (sampled 1999594 of 12497500 pairs -- exact computation would be O(n^2))
+
+Sync samples: 637 total, 214 rejected as RTT outliers (33.59%)
+Events corrected: 3961 naive (1039 uncorrected), 3961 weighted (1039 uncorrected)
+
+First 10 events by true order vs raw order:
+  Rank    SrcID      true_time (ns)     local_time (ns)   offset (ns)
+     0       13 1767225600000003947 1767225600001470787       1466840
+     1        3 1767225600000004391 1767225599998804554      -1199837
+     2       15 1767225600000006157 1767225600002006931       2000774
+     3        0 1767225600000006761 1767225599998006702      -2000059
+     4        5 1767225600000007654 1767225599999339985       -667669
+     5       11 1767225600000007831 1767225600000940585        932754
+     6        4 1767225600000008479 1767225599999076146       -932333
+     7        2 1767225600000008964 1767225599998542758      -1466206
+     8        7 1767225600000009107 1767225599999874701       -134406
+     9        2 1767225600000009927 1767225599998542932      -1466995

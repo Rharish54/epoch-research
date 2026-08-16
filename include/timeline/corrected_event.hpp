@@ -5,12 +5,19 @@
 
 namespace chronos {
 
-// A MarketEvent's corrected global timestamp. Confidence-interval fields
-// (lower_bound, upper_bound) are added in Phase 4; only the point estimate
-// is populated here.
+// A MarketEvent's corrected global timestamp plus an uncertainty interval.
+// lower_bound/upper_bound bracket the corrected_time by the offset
+// estimator's uncertainty half-width (see
+// DriftAwareOffsetEstimator::OffsetEstimate) and are the basis for
+// ordering::classify (definite-before / definite-after / ambiguous), rather
+// than comparing corrected_time directly -- forcing a total order from a
+// point estimate alone would claim more precision than the estimator
+// actually has.
 struct CorrectedEvent {
     MarketEvent original;
     NsTimestamp corrected_time;
+    NsTimestamp lower_bound;
+    NsTimestamp upper_bound;
 };
 
 } // namespace chronos

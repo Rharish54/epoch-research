@@ -39,7 +39,8 @@ void DriftAwareOffsetEstimator::add_sample(const SyncSample& sample) {
     accepted_.push_back(Entry{key, sample.estimated_offset, sample.round_trip_delay});
 }
 
-std::optional<NsDuration> DriftAwareOffsetEstimator::estimate_at(NsTimestamp query_time) const {
+std::optional<DriftAwareOffsetEstimator::OffsetEstimate>
+DriftAwareOffsetEstimator::estimate_with_uncertainty_at(NsTimestamp query_time) const {
     // accepted_ is kept in non-decreasing key order (samples arrive in
     // chronological order), so an upper_bound-style scan finds the last
     // entry with key <= query_time.
@@ -86,7 +87,42 @@ std::optional<NsDuration> DriftAwareOffsetEstimator::estimate_at(NsTimestamp que
     const double x_min = static_cast<double>(accepted_[start_idx].key - anchor);
     const double x_max = static_cast<double>(accepted_[end_idx - 1].key - anchor);
     const double x_query = std::clamp(static_cast<double>(query_time - anchor), x_min, x_max);
-    return static_cast<NsDuration>(intercept + slope * x_query);
+    const auto offset = static_cast<NsDuration>(intercept + slope * x_query);
+
+    // Uncertainty half-width: the larger of two explainable, physically
+    // grounded bounds (see the OffsetEstimate doc comment in the header).
+    //
+    // Bound 1 -- half the window's median RTT. Sync exchanges can't resolve
+    // offset more precisely than this from timing alone under the standard
+    // symmetric-network-delay assumption.
+    std::vector<NsDuration> window_rtts;
+    window_rtts.reserve(end_idx - start_idx);
+    for (std::size_t i = start_idx; i < end_idx; ++i) window_rtts.push_back(accepted_[i].rtt);
+    std::sort(window_rtts.begin(), window_rtts.end());
+    const double rtt_bound = static_cast<double>(window_rtts[window_rtts.size() / 2]) / 2.0;
+
+    // Bound 2 -- weighted RMS residual of the fit: how much the accepted
+    // samples actually scatter around the fitted line. Grows when drift is
+    // noisy or the linear model fits the window poorly.
+    double weighted_sq_residual = 0.0;
+    for (std::size_t i = start_idx; i < end_idx; ++i) {
+        const double x   = static_cast<double>(accepted_[i].key - anchor);
+        const double y   = static_cast<double>(accepted_[i].offset);
+        const double rtt = static_cast<double>(std::max<NsDuration>(accepted_[i].rtt, 1));
+        const double w   = 1.0 / rtt;
+        const double residual = y - (intercept + slope * x);
+        weighted_sq_residual += w * residual * residual;
+    }
+    const double residual_rms = Sw > 0.0 ? std::sqrt(weighted_sq_residual / Sw) : 0.0;
+
+    const auto uncertainty = static_cast<NsDuration>(std::max(rtt_bound, residual_rms));
+    return OffsetEstimate{offset, uncertainty};
+}
+
+std::optional<NsDuration> DriftAwareOffsetEstimator::estimate_at(NsTimestamp query_time) const {
+    const auto est = estimate_with_uncertainty_at(query_time);
+    if (!est) return std::nullopt;
+    return est->offset;
 }
 
 } // namespace chronos

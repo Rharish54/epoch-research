@@ -36,9 +36,34 @@ public:
     // it can't influence the fit or a future rolling-median comparison.
     void add_sample(const SyncSample& sample);
 
+    // A point offset estimate paired with a symmetric uncertainty half-width.
+    // The true offset is not guaranteed to fall within
+    // [offset - uncertainty, offset + uncertainty] -- this is a heuristic
+    // bound, not a statistical confidence interval with a stated coverage
+    // probability -- but it is derived from two explainable, physically
+    // grounded quantities (see estimate_with_uncertainty_at):
+    //   1. Half the window's median round-trip delay: assuming roughly
+    //      symmetric outbound/inbound network delay, the true offset cannot
+    //      be pinned down more precisely than this from sync timing alone
+    //      (the classic NTP error-bound argument).
+    //   2. The weighted RMS residual of the linear fit: how much the
+    //      accepted samples actually scatter around the fitted line, which
+    //      grows when drift is noisy or the linear model fits poorly.
+    // uncertainty is the larger of the two, so whichever source of error
+    // dominates in a given window sets the bound.
+    struct OffsetEstimate {
+        NsDuration offset;
+        NsDuration uncertainty; // half-width, always >= 0
+    };
+
     // Weighted-least-squares estimate at query_time, fit over the last
     // window_size *accepted* samples with key <= query_time. Returns
     // std::nullopt if no accepted sample exists at or before query_time.
+    std::optional<OffsetEstimate> estimate_with_uncertainty_at(NsTimestamp query_time) const;
+
+    // Convenience wrapper over estimate_with_uncertainty_at that discards
+    // the uncertainty half-width. Kept for callers (and existing tests) that
+    // only need the point estimate.
     std::optional<NsDuration> estimate_at(NsTimestamp query_time) const;
 
     std::size_t accepted_count() const noexcept { return accepted_.size(); }

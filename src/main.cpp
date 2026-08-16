@@ -1,10 +1,12 @@
 #include "clock/drift_estimator.hpp"
 #include "clock/offset_estimator.hpp"
 #include "metrics/accuracy.hpp"
+#include "metrics/ambiguity.hpp"
 #include "metrics/percentile.hpp"
 #include "network/latency_model.hpp"
 #include "simulation/event_source.hpp"
 #include "simulation/sync_exchange.hpp"
+#include "timeline/corrected_event.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -372,6 +374,14 @@ int main(int argc, char** argv) {
     // sync-sample noise: it reflects what actually reaches ordering accuracy.
     std::vector<double> naive_error_ns, weighted_error_ns;
 
+    // Phase 4: weighted-corrected events carrying an uncertainty interval,
+    // fed to the ambiguity classifier below. Events with no sync sample yet
+    // get a zero-width interval at the uncorrected local time -- consistent
+    // with the point-estimate fallback above, and such events are rare
+    // (only the first few per source, before their first sync sample).
+    std::vector<chronos::CorrectedEvent> corrected_events;
+    corrected_events.reserve(local_sorted.size());
+
     std::size_t naive_uncorrected = 0, weighted_uncorrected = 0;
     for (const auto& e : local_sorted) {
         true_times.push_back(e.true_time);
@@ -389,15 +399,24 @@ int main(int argc, char** argv) {
             ++naive_uncorrected;
         }
 
-        const auto weighted_offset = drift_estimators[src_idx].estimate_at(e.source_local_time);
-        if (weighted_offset) {
-            const chronos::NsTimestamp corrected = e.source_local_time - *weighted_offset;
+        const auto weighted_est = drift_estimators[src_idx].estimate_with_uncertainty_at(e.source_local_time);
+        chronos::CorrectedEvent ce;
+        ce.original = e;
+        if (weighted_est) {
+            const chronos::NsTimestamp corrected = e.source_local_time - weighted_est->offset;
             weighted_times.push_back(corrected);
             weighted_error_ns.push_back(std::abs(static_cast<double>(e.true_time - corrected)));
+            ce.corrected_time = corrected;
+            ce.lower_bound     = corrected - weighted_est->uncertainty;
+            ce.upper_bound     = corrected + weighted_est->uncertainty;
         } else {
             weighted_times.push_back(e.source_local_time); // no sync sample yet -- leave uncorrected
             ++weighted_uncorrected;
+            ce.corrected_time = e.source_local_time;
+            ce.lower_bound     = e.source_local_time;
+            ce.upper_bound     = e.source_local_time;
         }
+        corrected_events.push_back(ce);
     }
 
     std::size_t total_rejected = 0;
@@ -410,6 +429,9 @@ int main(int argc, char** argv) {
     const chronos::AccuracyResult weighted_result =
         chronos::pairwise_ordering_accuracy(true_times, weighted_times, cfg.seed);
 
+    const chronos::AmbiguityResult ambiguity_result =
+        chronos::classify_pairs(corrected_events, cfg.seed);
+
     // Ground-truth order, for the display table and CSV below.
     std::vector<chronos::MarketEvent> true_sorted = all_events;
     std::sort(true_sorted.begin(), true_sorted.end(),
@@ -418,7 +440,7 @@ int main(int argc, char** argv) {
               });
 
     // Print report.
-    std::cout << "\nChronos Phase 3 — Simulation Report\n";
+    std::cout << "\nChronos Phase 4 — Simulation Report\n";
     std::cout << "-------------------------------------\n";
     std::cout << "Sources:                 " << cfg.num_sources   << "\n";
     std::cout << "Events generated:        " << all_events.size() << "\n";
@@ -456,6 +478,34 @@ int main(int argc, char** argv) {
                << chronos::percentile(weighted_error_ns, 0.5)  << " / "
                << chronos::percentile(weighted_error_ns, 0.95) << " / "
                << chronos::percentile(weighted_error_ns, 0.99) << " ns\n";
+    std::cout << "\n";
+    std::cout << "\n";
+    std::cout << "Confidence-interval classification (weighted-corrected events):\n";
+    std::cout << "  Definite pairs:   " << ambiguity_result.definite_pairs << " ("
+               << (ambiguity_result.pairs_considered > 0
+                       ? 100.0 * static_cast<double>(ambiguity_result.definite_pairs) / static_cast<double>(ambiguity_result.pairs_considered)
+                       : 0.0)
+               << "%), correct: " << ambiguity_result.definite_correct << " ("
+               << (ambiguity_result.definite_pairs > 0
+                       ? 100.0 * static_cast<double>(ambiguity_result.definite_correct) / static_cast<double>(ambiguity_result.definite_pairs)
+                       : 100.0)
+               << "%)\n";
+    std::cout << "  Ambiguous pairs:  " << ambiguity_result.ambiguous_pairs << " ("
+               << (ambiguity_result.pairs_considered > 0
+                       ? 100.0 * static_cast<double>(ambiguity_result.ambiguous_pairs) / static_cast<double>(ambiguity_result.pairs_considered)
+                       : 0.0)
+               << "%)\n";
+    std::cout << "  Point-estimate errors: " << ambiguity_result.point_estimate_errors
+               << ", caught by ambiguity flag: " << ambiguity_result.point_estimate_errors_flagged_ambiguous
+               << " ("
+               << (ambiguity_result.point_estimate_errors > 0
+                       ? 100.0 * static_cast<double>(ambiguity_result.point_estimate_errors_flagged_ambiguous) / static_cast<double>(ambiguity_result.point_estimate_errors)
+                       : 100.0)
+               << "%)\n";
+    if (ambiguity_result.sampled) {
+        std::cout << "  (sampled " << ambiguity_result.pairs_considered << " of "
+                   << ambiguity_result.total_pairs << " pairs -- exact computation would be O(n^2))\n";
+    }
     std::cout << "\n";
     std::cout << "Sync samples: " << total_sync_samples << " total, " << total_rejected
                << " rejected as RTT outliers ("
