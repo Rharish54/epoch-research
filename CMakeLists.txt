@@ -40,7 +40,13 @@ FetchContent_MakeAvailable(googlebenchmark)
 # for the main executable, tests, and benchmarks.
 add_library(chronos_lib STATIC
     src/clock/clock_model.cpp
+    src/clock/offset_estimator.cpp
+    src/clock/drift_estimator.cpp
     src/simulation/event_source.cpp
+    src/simulation/sync_exchange.cpp
+    src/network/latency_model.cpp
+    src/metrics/accuracy.cpp
+    src/metrics/percentile.cpp
 )
 target_include_directories(chronos_lib PUBLIC include)
 
@@ -53,6 +59,13 @@ enable_testing()
 
 add_executable(chronos_tests
     tests/clock_model_test.cpp
+    tests/event_source_test.cpp
+    tests/accuracy_test.cpp
+    tests/latency_model_test.cpp
+    tests/sync_exchange_test.cpp
+    tests/offset_estimator_test.cpp
+    tests/drift_estimator_test.cpp
+    tests/percentile_test.cpp
 )
 target_link_libraries(chronos_tests PRIVATE
     chronos_lib

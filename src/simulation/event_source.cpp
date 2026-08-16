@@ -27,6 +27,7 @@ EventSource::EventSource(SourceId                 source_id,
     // exponential_distribution rate = 1/mean
     , inter_event_dist_(1.0 / static_cast<double>(src_cfg.mean_inter_event_ns))
     , type_dist_(0, kEventTypes.size() - 1)
+    , next_local_event_id_(src_cfg.starting_event_id)
     , current_true_time_(src_cfg.start_time_ns)
 {}
 

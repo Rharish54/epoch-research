@@ -13,6 +13,12 @@ struct EventSourceConfig {
     NsTimestamp  start_time_ns       = 0;
     NsDuration   mean_inter_event_ns = 1'000'000; // 1 ms default
     std::uint64_t seed               = 0;
+
+    // First event_id this source will assign; subsequent events increment
+    // from here. Two sources sharing a starting_event_id will produce
+    // colliding event_id sequences -- callers that pool events from multiple
+    // sources must assign each source a disjoint range.
+    std::uint64_t starting_event_id  = 0;
 };
 
 // Generates a stream of MarketEvents from a single simulated source.

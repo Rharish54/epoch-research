@@ -1,8 +1,17 @@
 {
-    "sources": 4,
-    "events": 1000,
+    "sources": 16,
+    "events": 5000,
     "seed": 42,
-    "drift_ppm": 100.0,
-    "max_offset_us": 500.0,
-    "noise_std_ns": 50.0
+    "drift_ppm": 300.0,
+    "max_offset_us": 2000.0,
+    "noise_std_ns": 50.0,
+    "inter_event_us": 10.0,
+    "sync_interval_us": 200.0,
+    "base_latency_us": 100.0,
+    "latency_asymmetry_us": 0.0,
+    "jitter_us": 50.0,
+    "spike_probability": 0.0,
+    "spike_multiplier": 10.0,
+    "drift_window": 10,
+    "outlier_rtt_multiplier": 3.0
 }
