@@ -1,5 +1,124 @@
-# epoch-research
-C++20 distributed timeline reconstructor which corrects clock skew, drift, and network jitter across concurrent market-data sources to recover true event ordering.
+# Chronos: Distributed Market Event Timeline Reconstructor
+
+Chronos is a C++20 simulator and reconstructor for distributed market-data timelines. It generates market events across many independent sources, each with its own imperfect clock (fixed offset plus drift), delivers those events over a simulated network with latency, jitter, and reordering, and then reconstructs the most defensible global ordering of what actually happened — combining sync-based offset estimation, a weighted drift model with outlier rejection, confidence intervals that distinguish *definite* from *ambiguous* orderings, and a causal dependency graph that catches (and helps resolve) timelines that are not just imprecise but outright impossible. Every phase's numbers below are produced by an actual, reproducible run on this machine — nothing here is estimated or invented.
+
+## Why Naive Timestamp Sorting Fails
+
+Sorting events by the timestamp each source reports (`source_local_time`) is the obvious first approach, and it is measurably wrong:
+
+- Sorting 5,000 events from 16 sources by `source_local_time` agrees with ground truth on only **71.36%** of pairwise comparisons (`results/phase5_baseline.txt`) — roughly one pair in four is placed backwards.
+- It is not merely imprecise, it is **impossible**: **487 of 997** causal edges (48.8%) are inverted in the raw timeline — nearly half of all order acknowledgements appear to precede their own submissions.
+
+A concrete example, transcribed directly from `results/phase5_baseline.txt`:
+
+```
+parent event 4064  local=1767225600001470629   (OrderSubmitted)
+  ->  child event 0  local=1767225599998006757  (OrderAcknowledged)
+```
+
+The child's reported local timestamp is **3.46 ms earlier** than its parent's — an order was "acknowledged" before it was "submitted," according to the raw clocks. No amount of sorting fixes this: the timeline itself is wrong, because the two clocks disagree. Detecting and correcting exactly this kind of impossibility is what the rest of this project builds toward.
+
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph SIM["Simulation (ground truth)"]
+        ES["EventSource<br/>exponential inter-event gaps<br/>true_time"]
+        CM["ClockModel<br/>local = true + offset<br/>+ drift·elapsed + noise<br/>-> source_local_time"]
+        CL["assign_causal_chains<br/>Submitted->Ack->Executed->Published<br/>(mutates type/parent only, never a timestamp)"]
+        ES --> CM --> CL
+    end
+
+    subgraph NET["Network (Boost.Asio, virtual time)"]
+        LM["LatencyModel<br/>base + jitter + asymmetry<br/>+ spikes + reordering"]
+        VS["VirtualTimeScheduler<br/>min-heap on (fire_time, seq)<br/>drained via io_context"]
+        AC["AsyncCollector<br/>stamps receive_time in place"]
+        LM --> VS --> AC
+    end
+
+    subgraph SYNC["Synchronization"]
+        SX["run_sync_schedule<br/>four-timestamp exchange t1..t4"]
+        OE["OffsetEstimator (naive)<br/>most recent sample"]
+        DE["DriftAwareOffsetEstimator<br/>1/RTT-weighted sliding-window fit<br/>+ RTT outlier rejection"]
+        SX --> OE
+        SX --> DE
+    end
+
+    subgraph REC["Reconstruction"]
+        CE["CorrectedEvent<br/>corrected_time +/- uncertainty<br/>= max(RTT/2, weighted RMS residual)"]
+        CG["CausalGraph<br/>DAG + Kahn topological sort"]
+        NI["narrow_intervals<br/>arc consistency, revert on infeasible"]
+        IO["classify_order<br/>Before / After / Ambiguous"]
+        CE --> CG --> NI --> IO
+    end
+
+    subgraph MET["Evaluation (ground truth only)"]
+        AR["pairwise_ordering_accuracy"]
+        AM["classify_pairs"]
+        CV["check_point / check_interval violations"]
+    end
+
+    CL --> LM
+    CL --> SX
+    AC --> CE
+    DE --> CE
+    OE --> CE
+    IO --> AR
+    IO --> AM
+    CG --> CV
+```
+
+| Component | Header |
+|---|---|
+| `EventSource`, `ClockModel` | `include/simulation/event_source.hpp`, `include/clock/clock_model.hpp` |
+| `assign_causal_chains` | `include/simulation/causal_linker.hpp` |
+| `LatencyModel`, `VirtualTimeScheduler`, `AsyncCollector` | `include/network/*.hpp` |
+| `run_sync_schedule` | `include/simulation/sync_exchange.hpp` |
+| `OffsetEstimator`, `DriftAwareOffsetEstimator` | `include/clock/offset_estimator.hpp`, `include/clock/drift_estimator.hpp` |
+| `CorrectedEvent`, `classify_order` | `include/timeline/corrected_event.hpp`, `include/timeline/interval_order.hpp` |
+| `CausalGraph`, `narrow_intervals` | `include/timeline/causal_graph.hpp`, `include/timeline/causal_constraints.hpp` |
+| `pairwise_ordering_accuracy`, `classify_pairs` | `include/metrics/accuracy.hpp`, `include/metrics/ambiguity.hpp` |
+
+## Quickstart
+
+Every flag below exists in `src/main.cpp`'s current CLI — nothing here is aspirational.
+
+```bash
+# 1. Build (Release -- required for benchmarks; never benchmark a Debug build)
+brew install boost
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)"
+cmake --build build -j
+
+# 2. Test (138 tests)
+ctest --test-dir build --output-on-failure
+
+# 3. Demo run (the baseline every README number above is measured at)
+./build/chronos --sources 16 --events 5000 --seed 42 --output results/demo_seed42.csv
+
+# 4. Benchmarks -> results/ as JSON
+./build/estimator_benchmark \
+    --benchmark_min_warmup_time=0.1 --benchmark_repetitions=3 \
+    --benchmark_report_aggregates_only=true \
+    --benchmark_format=json --benchmark_out=results/benchmark_estimator.json
+./build/reconstruction_benchmark \
+    --benchmark_min_warmup_time=0.1 --benchmark_repetitions=3 \
+    --benchmark_report_aggregates_only=true \
+    --benchmark_format=json --benchmark_out=results/benchmark_reconstruction.json
+
+# 5. Analysis -> markdown tables on stdout, flat CSV for plotting
+python3 scripts/analyze_results.py results/benchmark_*.json \
+    --csv results/benchmark_summary.csv
+
+# 6. Plots (optional; requires matplotlib -- pip may refuse a system-wide
+#    install per PEP 668, in which case use a venv as shown)
+python3 -m venv .venv && .venv/bin/pip install matplotlib
+.venv/bin/python3 scripts/plot_results.py --outdir results/plots
+
+# 7. Scale run (substantiates the "million events" claim in Results Summary)
+./build/chronos --sources 64 --events 1000000 --seed 42 > results/phase7_scale_1m.txt
+```
+
+Reproducing a specific experiment: each `results/*.txt` file begins with the exact configuration it was produced with.
 
 ## Building
 
@@ -13,6 +132,32 @@ ctest --test-dir build --output-on-failure
 ```
 
 `-DCMAKE_PREFIX_PATH="$(brew --prefix)"` is defensive (helps CMake find Boost's CMake config on Intel macOS or a non-default Homebrew prefix); it's usually unnecessary on Apple Silicon but harmless either way.
+
+## Clock and Network Models
+
+Every source's clock is modeled as (`include/clock/clock_model.hpp`):
+
+```
+local_time = true_time + offset + drift_ppm * 1e-6 * (true_time - reference) + N(0, noise_std)
+```
+
+`offset` is a fixed per-source bias (spread symmetrically across `±--max-offset-us`, so the population contains both early and late clocks rather than a shared bias), `drift_ppm` accumulates linearly with elapsed time and alternates sign by source index (`main.cpp`'s source loop: `(s % 2 == 0 ? +1 : -1) * drift_ppm`) so the population contains both fast and slow clocks, and `N(0, noise_std)` is per-sample gaussian jitter. `ClockModel` keeps **two independent noise channels** (`NoiseChannel::Event` and `NoiseChannel::Sync`), so a source's regular event-generation noise and its sync-exchange noise never share RNG state — perturbing one can never silently perturb the other, which is load-bearing for every reproducibility guarantee in this project.
+
+Sources and the collector synchronize via a four-timestamp exchange (`run_sync_schedule`, `include/simulation/sync_exchange.hpp`):
+
+```
+t1: collector sends sync request         (true/collector time)
+t2: source receives sync request         (source's distorted local clock)
+t3: source sends sync response           (source's distorted local clock)
+t4: collector receives sync response     (true/collector time)
+
+offset = ((t2 - t1) + (t3 - t4)) / 2
+delay  = (t4 - t1) - (t3 - t2)
+```
+
+This assumes roughly symmetric one-way network delay (outbound ≈ inbound); `--latency-asymmetry-us` breaks that assumption deliberately, to let experiments quantify how much asymmetry biases the offset estimate.
+
+`LatencyModel` (`include/network/latency_model.hpp`) models the network itself: a base one-way delay (`--base-latency-us`), gaussian jitter (`--jitter-us`), an asymmetric outbound/inbound split (`--latency-asymmetry-us`), probabilistic multiplicative spikes (`--spike-probability` / `--spike-multiplier`), and probabilistic adjacent-pair reordering (`--reorder-probability`, Phase 6).
 
 ## Phase 3: Drift Estimation and Outlier Rejection
 
@@ -116,7 +261,7 @@ Two honest observations from these numbers, not the ones a marketing-driven writ
 
 ## Phase 5: Causal Graph
 
-Phase 4 gives every event a defensible uncertainty interval, but timing evidence alone has a floor: when two intervals overlap, the pair is ambiguous even if we *know* the order from protocol semantics — an order cannot be acknowledged before it is submitted. Phase 5 adds that second, independent source of evidence: cross-source causal chains (`OrderSubmitted -> OrderAcknowledged -> OrderExecuted -> TradePublished`), a directed graph over them, violation detection against three different timeline representations, and interval narrowing that propagates causal constraints back into the Phase 4 bounds.
+Phase 4 gives every event a defensible uncertainty interval, but timing evidence alone has a floor: when two intervals overlap, the pair is ambiguous even if we *know* the order from protocol semantics — an order cannot be acknowledged before it is submitted. Phase 5 adds that second, independent source of evidence: cross-source causal chains (`OrderSubmitted -> OrderAcknowledged -> OrderExecuted -> TradePublished`), a directed graph over them, violation detection against three different timeline representations, and interval narrowing that propagates causal constraints back into the Phase 4 bounds. See the [Architecture](#architecture) diagram for where this sits in the overall pipeline.
 
 ### Causal chain generation
 
@@ -241,3 +386,123 @@ Flat across source count, exactly as the virtual-time design predicts: wall-cloc
 
 - **Realized delivery latency matches `LatencyModel`'s synchronous draw distribution exactly**, because the collector has unbounded capacity and virtual time adds no queueing delay. The async layer changes *ordering and interleaving*, not the latency distribution — adding a queueing/service-time model would change that, and is deliberately out of scope here.
 - **`apply_reordering`'s effect on the aggregate same-source-inversion count is small and inconsistent in direction, not a clean "more reordering" signal.** Comparing `results/phase6_baseline.txt` (`--reorder-probability 0`, 3587 inversions) against `results/phase6_reorder.txt` (`--reorder-probability 0.3`, 3585 inversions) shows essentially no aggregate change; a moderate-jitter comparison (`--jitter-us 5`) showed a small *decrease* (1152 -> 1128) enabling reordering. This is because `apply_reordering` swaps adjacent-pair *values* in an already-i.i.d.-jitter-drawn delay sequence — the multiset of realized latencies is provably unchanged either way (see `ReorderingPermutesLatencyPairingsOnlyNotTheMultiset`), so its effect on any aggregate statistic over that multiset is genuinely small and can move in either direction depending on which specific pairs happen to get swapped. With jitter off entirely, every delay value is identical, so swapping identical values is a mathematical no-op on delivery order regardless of `reorder_probability` — verified directly (`--jitter-us 0` gives 0 same-source inversions at both `--reorder-probability 0` and `1`). The primitive's integration and correctness are proven directly at the individual-event level instead (`ApplyReorderingSwapsExpectedDelayPairingIntoRealReceiveTimes` hand-computes the exact expected post-swap `receive_time` and asserts the real pipeline matches it exactly) — that is the right level to verify this mechanism at, not an aggregate CLI statistic that a symmetric pairwise swap of already-random values isn't well-suited to move.
+
+## Benchmarks
+
+```text
+Hardware:  Apple M2, 8 cores, 16 GiB RAM
+OS:        macOS 26.5.2 (25F84), Darwin 25.5.0 arm64
+Compiler:  Apple clang 16.0.0 (clang-1600.0.26.6), target arm64-apple-darwin25.5.0
+CMake:     4.3.4
+Flags:     -std=c++20 -O3 -DNDEBUG (CMAKE_BUILD_TYPE=Release; verified via CMakeCache.txt,
+           not assumed), -Wall -Wextra -Wpedantic -Wno-unused-parameter
+Config:    seed 42, 16 sources unless noted, ±300 ppm drift, ±2000 us max offset,
+           100 us base latency, 50 us jitter, no spikes, 200 us sync interval,
+           drift window 10, causal chain fraction 0.3
+```
+
+Google Benchmark's own `mhz_per_cpu` context field reads 24 (it cannot read `hw.cpufrequency` on Apple Silicon and falls back to a placeholder) — ignore that field; the real CPU is an Apple M2. Every table below is `mean` across 3 repetitions, reproduced via the Quickstart's step 4 commands, full data in `results/benchmark_summary.csv`.
+
+### Clock-offset estimation (`estimator_benchmark`)
+
+**Naive vs. weighted query throughput** — the actual honest finding here is the opposite of what might be assumed: the *more accurate* `DriftAwareOffsetEstimator` is measurably **slower** per query than the naive `OffsetEstimator`, because a weighted least-squares fit over a window costs real compute versus a single `std::map` lookup:
+
+| Estimator | Window/size | Query time | Items/sec |
+|---|---|---|---|
+| `OffsetEstimator` (naive) | 64 samples stored | 6.6 ns | 150.9M/s |
+| `OffsetEstimator` (naive) | 4096 samples stored | 16.7 ns | 57.8M/s |
+| `DriftAwareOffsetEstimator` (weighted) | window=5 | 74 ns | 13.5M/s |
+| `DriftAwareOffsetEstimator` (weighted) | window=50 | 663 ns | 1.5M/s |
+
+Weighted-estimator query cost scales roughly linearly with window size (5 -> 50 is a ~9x slowdown), since the fit touches every windowed sample; the naive estimator's query cost instead grows slowly with total stored history (an `std::map` lookup, O(log n)). Accuracy is the reason to prefer the weighted estimator (Phase 3), not speed — this benchmark measures a real, opposite-of-assumed cost of that accuracy.
+
+**Ingest throughput** (`BM_DriftEstimator_AddSample`, 4096 samples): 36.8M items/sec at window=5, falling to 1.9M items/sec at window=50 — the sliding-window rolling-median outlier check and fit maintenance both scale with window size. Outlier-spike fraction (`BM_DriftEstimator_AddSample_Spiky`) has negligible effect on ingest cost (12.0-12.3M items/sec across 0%/5%/25% spike fractions) — the rolling-median rejection check is cheap relative to the fit itself.
+
+### Timeline reconstruction (`reconstruction_benchmark`)
+
+Every number below passed the mandatory corpus-validation check: the ported benchmark corpus at `sources=16, events=5000, seed=42` reproduces the committed `results/phase5_baseline.txt` numbers exactly (71.36% raw accuracy, 92.46% weighted-corrected accuracy, 997 causal edges, 487 raw-timeline violations) before any benchmark number here is trusted.
+
+| Benchmark | 5,000 events | 20,000 events | 50,000 events |
+|---|---|---|---|
+| `CausalGraph::build` | 201 us (25.0M/s) | 877 us (22.9M/s) | — |
+| `narrow_intervals` | 66 us (75.3M/s) | 385 us (54.7M/s) | — |
+| **`BM_Reconstruct_Pipeline`** (correct + graph + narrow) | 802 us (**6.26M/s**) | 3.93 ms (5.09M/s) | 11.0 ms (**4.67M/s**) |
+
+**Honest finding, not a scaling bug**: `classify_pairs` and `pairwise_ordering_accuracy` both hard-cap at `kMaxExactPairs = 2,000,000` (`src/metrics/accuracy.cpp:11`, `src/metrics/ambiguity.cpp:13`), reached at ~2,000 events — their measured runtime is flat (71.3 ms -> 65.7 ms and 62.2 ms -> 62.0 ms from 5,000 to 20,000 events) purely because of that sampling ceiling, not because the underlying algorithm scales sub-linearly. Reported `items/sec` for these two (measuring *calls per second*, not events per second, since each call does a bounded amount of work regardless of input size) should not be read as a throughput claim.
+
+**End-to-end async delivery, refining a Phase 6 claim**: Phase 6's source-count sweep reported delivery time as flat across source count, but that was measured at millisecond resolution (four identical `3 ms` readings). At real microsecond resolution (`BM_EndToEnd_AsyncDelivery`, 20,000 events, 3 repetitions), delivery time **does** grow mildly and consistently with source count — 3,473 us at 1 source to 3,928 us at 64 sources, a real ~13% increase, plotted in `results/plots/async_delivery_scaling.png`. This is very likely per-source setup overhead (constructing N independent `LatencyModel` instances), not the core heap-drain loop, which remains O(events) regardless of source count — but it is a genuine, measured effect the earlier coarse-grained table did not show.
+
+### Per-event correction latency
+
+`BM_PerEventCorrectionLatency` (50,000 events, 3 repetitions) reports p50/p95/p99 = **83 / 125 / 167 ns** per `estimate_with_uncertainty_at` call, computed via the same `chronos::percentile()` utility `main.cpp` uses for its own offset-error and delivery-latency percentiles. `BM_TimerOverhead` (the companion benchmark, bare back-to-back `steady_clock::now()` calls) measured p50 = 0 ns at this clock's resolution — overhead is not distinguishable from zero relative to the 83-166 ns range being measured, so these percentiles are trustworthy as reported, not dominated by measurement artifact.
+
+### Peak memory
+
+`Peak RSS: 596.4 MiB` at the 1,000,000-event scale run (`results/phase7_scale_1m.txt`, 64 sources) — `main.cpp` holds several parallel copies of the event population during correction (`all_events`, `local_sorted`, `true_sorted`, `corrected_events`, `narrowed_events`, plus five timestamp vectors), so this is a real, non-trivial cost of the current single-pass, fully-materialized design. Reported via `getrusage(RUSAGE_SELF, ...)` to stderr (never stdout, preserving every committed report's byte-diffability); not wired into Google Benchmark's output, since GB's process-wide RSS would be polluted by every prior benchmark's peak in the same process.
+
+### Plots
+
+![Ordering accuracy by pipeline stage](results/plots/accuracy_stages.png)
+![Reconstruction throughput vs. event count](results/plots/reconstruction_throughput.png)
+![Async delivery time vs. source count](results/plots/async_delivery_scaling.png)
+
+## What Was Difficult
+
+Six items, all grounded in this project's own already-documented history — nothing invented for this section:
+
+1. **Outlier rejection turned out to be nearly redundant with RTT-weighting.** `results/phase3_latency_spikes_no_rejection.txt` shows *disabling* rejection produced marginally *better* weighted error (15844/48231/64296 vs. 17336/51657/73297 ns). The difficulty was resisting the urge to bury that and instead working out *why*: `1/RTT` weighting already suppresses spiky samples inside the fit, so hard rejection only earns its keep at pollution levels beyond what was tested.
+2. **Uniform pair sampling diluted the exact signal the interval logic was built to demonstrate.** Definite-pair accuracy landed at 92.51%, essentially equal to overall corrected accuracy, because `classify_pairs` samples uniformly over 5,000 events spanning the whole run — most sampled pairs are trivially separable and never where errors live. Diagnosing this as a *measurement design* flaw rather than a logic flaw took a separate metric (`evaluate_causal_pairs`, exact over graph edges) to confirm.
+3. **Interval narrowing failed on 62% of linked nodes at default event spacing** — and the cause was a design decision made three phases earlier for a different reason. Linking each chain to the temporally *nearest* cross-source event maximizes the headline "impossible timeline" effect, but produces true gaps smaller than a 17-90 us heuristic interval can resolve, so most chains are judged jointly infeasible and reverted. Only at `--inter-event-us 500` does narrowing work well (1.7% reverted, 99.98% accuracy). The hard part was accepting that the narrowing implementation was correct and the *experiment* was mis-parameterized.
+4. **The soundness argument for narrowing has a premise that does not hold.** Narrowing is provably safe *if* every input interval contains its true time — but Phase 4's uncertainty is `max(RTT/2, RMS residual)`, a heuristic bound with no coverage guarantee, and the measured 92.51% definite-pair accuracy proves a material share of intervals miss. That forced the connected-component revert mechanism, which is the least obvious code in the repo and exists solely because a clean proof turned out to rest on a false assumption.
+5. **Proving the Phase 6 rewrite changed nothing it shouldn't.** Replacing the synchronous `receive_time` fill with an async pipeline had to leave every Phase 3-5 metric bit-identical. That was achieved by *reusing the exact per-source seed stream in the same consumption order* rather than introducing a new one — verified by diffing a fresh run against `results/phase5_baseline.txt`. Designing for that constraint up front was harder than the Asio code itself.
+6. **`apply_reordering` resisted aggregate verification.** Enabling it barely moved same-source inversions (3587 -> 3585), and at moderate jitter moved them the *wrong* way (1152 -> 1128, confirmed again in this phase's own benchmark work). The resolution was proving the multiset of realized latencies is provably unchanged by a symmetric pairwise swap, so no aggregate statistic over that multiset *can* move reliably — and then verifying the primitive at the individual-event level instead. Choosing the right level of verification, rather than chasing a statistic that could not exist, was the difficult part.
+
+## Future Improvements
+
+From CLAUDE.md's own list: real UDP sockets instead of simulated async messages; multiple collector nodes; more advanced robust regression (Theil-Sen / RANSAC) in place of weighted least squares; Kalman filtering for offset and drift as a joint state-space model; a PTP/NTP comparison mode; binary event serialization; lock-free queues; flamegraphs and deeper profiling; a dashboard visualization.
+
+Specific items genuinely deferred during this build (more credible than a generic list, since each is traceable to an actual decision made along the way):
+
+- **Config-file support.** `config/simulation.json` exists in the tree but is read by nothing; the CLI's 18 flags carry the whole configuration surface. Deferred explicitly per this project's own principle of keeping the CLI simple first.
+- **Locality-biased pair sampling.** The Phase 4 dilution finding above points directly at it: sampling temporally *adjacent* pairs instead of uniform-random ones would show the interval logic's real value instead of diluting it.
+- **A queueing/service-time model in the async collector.** Today capacity is unbounded and virtual time adds no queueing delay, so realized latency exactly matches the draw distribution (confirmed in the Phase 6 section) — the async layer changes ordering, not latency.
+- **Calibrated/adaptive uncertainty.** Replacing `max(RTT/2, RMS residual)` with a bound tuned so measured coverage matches its stated probability would directly attack the 62% narrowing-revert rate.
+- **Extracting `main.cpp`'s pipeline into a reusable `run_simulation()`.** The ~700-line body is currently duplicated in outline by `benchmarks/reconstruction_benchmark.cpp`'s corpus builder; consolidating is worthwhile once a third real caller appears, and was deliberately deferred until then rather than abstracted prematurely.
+
+## Results Summary
+
+Every number below traces to a specific file committed in this repository from this project's own execution — never estimated, never carried over from a mismatched config, never rounded up.
+
+| Resume bullet placeholder | Value | Source |
+|---|---|---|
+| `[X]` concurrent sources | **64** | `results/phase6_sources_64.txt`, `results/phase7_scale_1m.txt`, `BM_EndToEnd_*` at 64 sources |
+| `[Y]`+ million events | **1** | `results/phase7_scale_1m.txt` (1,000,000 events, 64 sources, seed 42 — 1.49s wall clock, 259ms async delivery, 596.4 MiB peak RSS) |
+| `[X]%` -> `[Y]%` ordering accuracy | **71.36% -> 92.46%** | `results/phase5_baseline.txt` — same run, same config, same sampled pairs; deliberately NOT the 99.98% wide-spacing figure, which is a different config and would misrepresent a same-config before/after |
+| `[Z]`+ events/sec (reconstruction) | **4,000,000+** | `BM_Reconstruct_Pipeline` at 50,000 events: 4,673,015 items/sec measured, rounded down |
+
+```latex
+\resumeProjectHeading
+    {
+        \textbf{Chronos: Distributed Market Event Timeline Reconstructor}
+        $|$
+        \emph{C++20, Boost.Asio, CMake, GoogleTest, Google Benchmark, Python}
+    }
+    {July 2026 -- Present}
+
+\resumeProjectItemListStart
+
+    \resumeItem{
+        Built a distributed C++20 simulator modeling clock offset, drift,
+        asymmetric network latency, jitter, and packet reordering across
+        64 concurrent market-data sources and 1+ million generated events
+    }
+
+    \resumeItem{
+        Developed an asynchronous synchronization and causal reconstruction
+        engine using weighted drift estimation, confidence intervals, outlier
+        rejection, and dependency graphs, improving event-ordering accuracy
+        from 71.36\% to 92.46\% while processing 4,000,000+ events per second
+    }
+
+\resumeProjectItemListEnd
+```

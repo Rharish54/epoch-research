@@ -1,5 +1,10 @@
 build/
+.venv/
 results/*.csv
 results/*.json
+!results/benchmark_estimator.json
+!results/benchmark_reconstruction.json
+!results/benchmark_summary.csv
+!results/accuracy_stages.csv
 *.o
 *.a

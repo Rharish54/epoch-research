@@ -28,6 +28,9 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/resource.h>
+#endif
 #include <vector>
 
 namespace {
@@ -734,6 +737,25 @@ int main(int argc, char** argv) {
         }
         std::cout << "\nEvents written to: " << cfg.output_path << "\n";
     }
+
+#if defined(__APPLE__) || defined(__linux__)
+    // Peak memory (CLAUDE.md's "if practical" Performance Metric). stderr,
+    // not stdout: a machine-dependent number on stdout would break the
+    // byte-for-byte diffs every committed results/*.txt depends on -- same
+    // precedent as the Phase 6 async-delivery timing line above.
+    struct rusage ru {};
+    if (getrusage(RUSAGE_SELF, &ru) == 0) {
+        // ru_maxrss is bytes on macOS/BSD, kilobytes on Linux -- the classic
+        // portability trap with this field.
+        const double mib =
+#if defined(__APPLE__)
+            static_cast<double>(ru.ru_maxrss) / (1024.0 * 1024.0);
+#else
+            static_cast<double>(ru.ru_maxrss) / 1024.0;
+#endif
+        std::cerr << "Peak RSS: " << mib << " MiB\n";
+    }
+#endif
 
     return 0;
 }

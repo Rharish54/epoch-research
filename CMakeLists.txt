@@ -98,8 +98,11 @@ target_link_libraries(chronos_tests PRIVATE
 include(GoogleTest)
 gtest_discover_tests(chronos_tests)
 
-# ---- Benchmarks (stub — populated in Phase 7) -------------------------------
-# add_executable(estimator_benchmark      benchmarks/estimator_benchmark.cpp)
-# add_executable(reconstruction_benchmark benchmarks/reconstruction_benchmark.cpp)
-# target_link_libraries(estimator_benchmark      PRIVATE chronos_lib benchmark::benchmark_main)
-# target_link_libraries(reconstruction_benchmark PRIVATE chronos_lib benchmark::benchmark_main)
+# ---- Benchmarks --------------------------------------------------------------
+# Release-only per CLAUDE.md's Benchmarking Rules -- never benchmark a Debug
+# build. Not registered with add_test/gtest_discover_tests: these are
+# benchmarks, not correctness tests, and would make `ctest` take minutes.
+add_executable(estimator_benchmark      benchmarks/estimator_benchmark.cpp)
+add_executable(reconstruction_benchmark benchmarks/reconstruction_benchmark.cpp)
+target_link_libraries(estimator_benchmark      PRIVATE chronos_lib benchmark::benchmark_main)
+target_link_libraries(reconstruction_benchmark PRIVATE chronos_lib benchmark::benchmark_main)

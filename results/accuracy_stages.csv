@@ -1,0 +1,7 @@
+stage,accuracy_pct,config,source_file
+raw local timestamp,71.36,default spacing,results/phase5_baseline.txt
+naive corrected,92.22,default spacing,results/phase5_baseline.txt
+weighted corrected,92.46,default spacing,results/phase5_baseline.txt
+weighted + causal,92.46,default spacing,results/phase5_baseline.txt
+weighted + causal,99.98,wide spacing (--inter-event-us 500),results/phase5_wide_spacing.txt
+arrival order (receive_time),98.24,default spacing,results/phase6_baseline.txt
