@@ -3,7 +3,9 @@
 #include "metrics/accuracy.hpp"
 #include "metrics/ambiguity.hpp"
 #include "metrics/percentile.hpp"
+#include "network/async_collector.hpp"
 #include "network/latency_model.hpp"
+#include "network/virtual_scheduler.hpp"
 #include "simulation/causal_linker.hpp"
 #include "simulation/event_source.hpp"
 #include "simulation/sync_exchange.hpp"
@@ -12,6 +14,8 @@
 #include "timeline/corrected_event.hpp"
 
 #include <algorithm>
+#include <boost/asio/io_context.hpp>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -20,6 +24,7 @@
 #include <iomanip>
 #include <iostream>
 #include <numeric>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -44,6 +49,7 @@ struct SimConfig {
     int         drift_window        = 10;      // samples retained by the weighted drift estimator
     double      outlier_rtt_multiplier = 3.0;  // reject sync samples with RTT > multiplier * rolling median
     double      causal_chain_fraction = 0.3;   // target fraction of events enlisted into causal chains
+    double      reorder_probability  = 0.0;    // [0,1] chance an adjacent async-delivery pair swaps
     std::string output_path;                   // empty = stdout only
 };
 
@@ -65,6 +71,7 @@ void print_usage(const char* prog) {
               << "  --drift-window N         samples in weighted drift fit (default 10)\n"
               << "  --outlier-rtt-multiplier F reject RTT > multiplier * rolling median (default 3.0)\n"
               << "  --causal-chain-fraction F target fraction of events in causal chains (default 0.3)\n"
+              << "  --reorder-probability F  chance an adjacent async-delivery pair swaps (default 0.0)\n"
               << "  --output PATH            write events CSV to PATH\n";
 }
 
@@ -135,6 +142,8 @@ SimConfig parse_args(int argc, char** argv) {
             cfg.outlier_rtt_multiplier = dbl();
         } else if (key == "--causal-chain-fraction") {
             cfg.causal_chain_fraction = dbl();
+        } else if (key == "--reorder-probability") {
+            cfg.reorder_probability = dbl();
         } else if (key == "--output") {
             cfg.output_path = std::string(next());
         } else if (key == "--help" || key == "-h") {
@@ -195,6 +204,10 @@ SimConfig parse_args(int argc, char** argv) {
         std::cerr << "--causal-chain-fraction must be within [0, 1]\n";
         std::exit(1);
     }
+    if (cfg.reorder_probability < 0.0 || cfg.reorder_probability > 1.0) {
+        std::cerr << "--reorder-probability must be within [0, 1]\n";
+        std::exit(1);
+    }
     return cfg;
 }
 
@@ -240,6 +253,13 @@ int main(int argc, char** argv) {
     std::vector<chronos::MarketEvent> all_events;
     all_events.reserve(cfg.total_events);
 
+    // Recorded at generation time (not recomputed later by scanning
+    // source_id) so the Phase 6 async delivery pass below has a
+    // source's exact slice within all_events regardless of whether any
+    // later pass ever reorders events in place (it doesn't today, but this
+    // removes the dependency on that continuing to hold).
+    std::vector<std::size_t> source_offsets, source_counts;
+
     // One estimator of each kind per source, indexed by source id. Both are
     // fed every sync sample -- naive unfiltered, weighted with its own
     // sliding-window + outlier rejection -- so the report can compare them
@@ -272,11 +292,14 @@ int main(int argc, char** argv) {
         const double drift = (s % 2 == 0 ? 1.0 : -1.0) * cfg.drift_ppm;
 
         // Derive per-source, per-stream seeds deterministically from the global seed.
+        // (kEventLatencySeedMul is reused below, at delivery time, for the
+        // Phase 6 async pipeline's per-source LatencyModel -- not derived
+        // here, since that model isn't constructed until every source has
+        // been generated and pooled.)
         const auto su             = static_cast<std::uint64_t>(s);
         const std::uint64_t clock_seed         = cfg.seed * kClockSeedMul        + su;
         const std::uint64_t src_seed           = cfg.seed * kEventGapSeedMul     + su;
         const std::uint64_t sync_latency_seed  = cfg.seed * kSyncLatencySeedMul  + su;
-        const std::uint64_t event_latency_seed = cfg.seed * kEventLatencySeedMul + su;
 
         chronos::ClockConfig clock_cfg{
             .offset_ns    = offset_ns,
@@ -300,25 +323,11 @@ int main(int argc, char** argv) {
         auto evts = source.generate(static_cast<std::size_t>(count));
         next_event_id_base += static_cast<std::uint64_t>(count);
 
-        // Populate receive_time via a dedicated, independently-seeded
-        // LatencyModel -- separate from the sync-link one below so that
-        // event delivery and sync-exchange latency draws never interleave
-        // on a shared RNG (the same reproducibility hazard the ClockModel
-        // dual-channel fix addresses). Unused by the correction logic below
-        // (which keys off source_local_time); this is here for Phase 6's
-        // async collector to consume.
-        chronos::LatencyConfig event_latency_cfg{
-            .base_ns           = base_latency_ns,
-            .asymmetry_ns      = asymmetry_ns,
-            .jitter_std_ns     = jitter_std_ns,
-            .spike_probability = cfg.spike_probability,
-            .spike_multiplier  = cfg.spike_multiplier,
-            .seed              = event_latency_seed,
-        };
-        chronos::LatencyModel event_latency(event_latency_cfg);
-        for (auto& e : evts) {
-            e.receive_time = e.true_time + event_latency.sample_latency(chronos::LinkDirection::Inbound);
-        }
+        // receive_time is populated below by the Phase 6 async delivery
+        // pipeline, once all sources' events are pooled -- delivery must
+        // share one scheduler/collector across every source so cross-source
+        // interleaving on a single collector (the whole point of doing this
+        // asynchronously) is actually possible.
 
         chronos::NsTimestamp max_true_time = kReferenceTimeNs;
         for (const auto& e : evts) max_true_time = std::max(max_true_time, e.true_time);
@@ -357,6 +366,8 @@ int main(int argc, char** argv) {
         }
         total_sync_samples += samples.size();
 
+        source_offsets.push_back(all_events.size());
+        source_counts.push_back(evts.size());
         for (auto& e : evts) all_events.push_back(std::move(e));
     }
 
@@ -372,6 +383,50 @@ int main(int argc, char** argv) {
             .seed           = cfg.seed * kCausalLinkSeedMul,
         });
 
+    // Phase 6: async delivery over a virtual-time Asio event loop. One
+    // shared scheduler and one shared collector across ALL sources -- that
+    // sharing is the point: cross-source interleaving on a single collector
+    // is what per-source-isolated delivery could never produce. Placed
+    // after causal linking (so the collector sees final event_type) and
+    // before local_sorted/corrected_events are built (so the stamped
+    // receive_time propagates into every downstream copy and the CSV).
+    boost::asio::io_context io{1}; // concurrency hint 1: strictly single-threaded
+    chronos::VirtualTimeScheduler scheduler(io);
+    chronos::AsyncCollector collector(std::span<chronos::MarketEvent>{all_events});
+
+    for (int s = 0; s < cfg.num_sources; ++s) {
+        chronos::LatencyConfig delivery_cfg{
+            .base_ns             = base_latency_ns,
+            .asymmetry_ns        = asymmetry_ns,
+            .jitter_std_ns       = jitter_std_ns,
+            .spike_probability   = cfg.spike_probability,
+            .spike_multiplier    = cfg.spike_multiplier,
+            .reorder_probability = cfg.reorder_probability,
+            // Reuses the exact seed stream the old synchronous fill used --
+            // with --reorder-probability 0, every receive_time below is
+            // therefore bit-identical to what a Phase 5 run would have
+            // produced with the naive fill, since it's the same generator
+            // consumed in the same order. Only delivery ORDER is new.
+            .seed = cfg.seed * kEventLatencySeedMul + static_cast<std::uint64_t>(s),
+        };
+        chronos::LatencyModel delivery(delivery_cfg);
+        chronos::schedule_source_delivery(
+            scheduler, collector, delivery,
+            std::span<const chronos::MarketEvent>{all_events}.subspan(
+                source_offsets[static_cast<std::size_t>(s)], source_counts[static_cast<std::size_t>(s)]),
+            source_offsets[static_cast<std::size_t>(s)],
+            cfg.reorder_probability > 0.0);
+    }
+
+    const auto async_start   = std::chrono::steady_clock::now();
+    const std::size_t delivered = scheduler.run();
+    const auto async_elapsed = std::chrono::steady_clock::now() - async_start;
+    // Wall-clock timing goes to stderr, never stdout: a real-time number on
+    // stdout would break the byte-for-byte reproducibility diff every
+    // committed results/*.txt file depends on.
+    std::cerr << "Async delivery: " << delivered << " events in "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(async_elapsed).count() << " ms\n";
+
     // Correction pass + accuracy measurement. Both use one canonical event
     // ordering -- sorted by source_local_time, matching Phase 1's raw-timeline
     // ordering exactly -- so raw and corrected accuracy sample identical
@@ -386,11 +441,12 @@ int main(int argc, char** argv) {
                   return a.source_local_time < b.source_local_time;
               });
 
-    std::vector<chronos::NsTimestamp> true_times, raw_times, naive_times, weighted_times;
+    std::vector<chronos::NsTimestamp> true_times, raw_times, naive_times, weighted_times, receive_times;
     true_times.reserve(local_sorted.size());
     raw_times.reserve(local_sorted.size());
     naive_times.reserve(local_sorted.size());
     weighted_times.reserve(local_sorted.size());
+    receive_times.reserve(local_sorted.size());
 
     // Per-event correction error (|true_time - corrected_time|), collected
     // separately per estimator -- this is what CLAUDE.md's median/p95/p99
@@ -410,6 +466,7 @@ int main(int argc, char** argv) {
     for (const auto& e : local_sorted) {
         true_times.push_back(e.true_time);
         raw_times.push_back(e.source_local_time);
+        receive_times.push_back(e.receive_time);
 
         const auto src_idx = static_cast<std::size_t>(static_cast<std::uint32_t>(e.source_id));
 
@@ -453,6 +510,13 @@ int main(int argc, char** argv) {
     const chronos::AccuracyResult weighted_result =
         chronos::pairwise_ordering_accuracy(true_times, weighted_times, cfg.seed);
 
+    // Phase 6: ordering accuracy if events were sorted purely by
+    // collector-arrival time. A different failure mode than raw_result: the
+    // collector clock is one clock, immune to per-source clock skew, but
+    // arrival order is polluted by network latency jitter instead.
+    const chronos::AccuracyResult arrival_result =
+        chronos::pairwise_ordering_accuracy(true_times, receive_times, cfg.seed);
+
     const chronos::AmbiguityResult ambiguity_result =
         chronos::classify_pairs(corrected_events, cfg.seed);
 
@@ -490,7 +554,7 @@ int main(int argc, char** argv) {
               });
 
     // Print report.
-    std::cout << "\nChronos Phase 5 — Simulation Report\n";
+    std::cout << "\nChronos Phase 6 — Simulation Report\n";
     std::cout << "-------------------------------------\n";
     std::cout << "Sources:                 " << cfg.num_sources   << "\n";
     std::cout << "Events generated:        " << all_events.size() << "\n";
@@ -503,6 +567,7 @@ int main(int argc, char** argv) {
     std::cout << "Drift window (samples):  " << cfg.drift_window  << "\n";
     std::cout << "Outlier RTT multiplier:  " << cfg.outlier_rtt_multiplier << "\n";
     std::cout << "Causal chain fraction:   " << cfg.causal_chain_fraction  << "\n";
+    std::cout << "Reorder probability:     " << cfg.reorder_probability    << "\n";
     std::cout << "\n";
     std::cout << std::fixed << std::setprecision(2);
 
@@ -516,6 +581,7 @@ int main(int argc, char** argv) {
     print_accuracy("Raw timestamp ordering accuracy:      ", raw_result);
     print_accuracy("Naive-corrected ordering accuracy:    ", naive_result);
     print_accuracy("Weighted-corrected ordering accuracy: ", weighted_result);
+    print_accuracy("Arrival-order (receive_time) accuracy:", arrival_result);
     std::cout << "Improvement (raw -> naive):            "
                << (naive_result.accuracy - raw_result.accuracy) * 100.0 << " pp\n";
     std::cout << "Improvement (naive -> weighted):       "
@@ -605,6 +671,24 @@ int main(int argc, char** argv) {
         std::cout << "Causal interval narrowing: skipped (graph contains a cycle)\n";
     }
     std::cout << "\n";
+    {
+        const auto& realized = collector.realized_latency_ns();
+        const auto  ds       = collector.stats();
+        std::cout << "Async delivery (virtual-time Asio pipeline):\n";
+        std::cout << "  Events delivered:            " << delivered << " / " << all_events.size() << "\n";
+        std::cout << "  Realized delivery latency -- median / p95 / p99: "
+                   << chronos::percentile(realized, 0.5)  << " / "
+                   << chronos::percentile(realized, 0.95) << " / "
+                   << chronos::percentile(realized, 0.99) << " ns\n";
+        std::cout << "  Same-source arrival inversions: " << ds.same_source_inversions << " / "
+                   << ds.same_source_pairs << " adjacent pairs ("
+                   << (ds.same_source_pairs > 0
+                           ? 100.0 * static_cast<double>(ds.same_source_inversions) / static_cast<double>(ds.same_source_pairs)
+                           : 0.0)
+                   << "%)\n";
+        std::cout << "  Reorder probability:         " << cfg.reorder_probability << "\n";
+    }
+    std::cout << "\n";
     std::cout << "Sync samples: " << total_sync_samples << " total, " << total_rejected
                << " rejected as RTT outliers ("
                << (total_sync_samples > 0 ? 100.0 * static_cast<double>(total_rejected) / static_cast<double>(total_sync_samples) : 0.0)
@@ -637,7 +721,7 @@ int main(int argc, char** argv) {
             std::cerr << "Could not open output file: " << cfg.output_path << "\n";
             return 1;
         }
-        out << "event_id,source_id,event_type,true_time_ns,local_time_ns,offset_ns,parent_event_id\n";
+        out << "event_id,source_id,event_type,true_time_ns,local_time_ns,offset_ns,parent_event_id,receive_time_ns\n";
         for (const auto& e : true_sorted) {
             out << static_cast<std::uint64_t>(e.event_id)   << ","
                 << static_cast<std::uint32_t>(e.source_id)  << ","
@@ -646,7 +730,7 @@ int main(int argc, char** argv) {
                 << e.source_local_time                       << ","
                 << (e.source_local_time - e.true_time)       << ",";
             if (e.parent_event_id) out << static_cast<std::uint64_t>(*e.parent_event_id);
-            out << "\n";
+            out << "," << e.receive_time << "\n";
         }
         std::cout << "\nEvents written to: " << cfg.output_path << "\n";
     }

@@ -35,6 +35,14 @@ set(BENCHMARK_ENABLE_INSTALL     OFF CACHE BOOL "" FORCE)
 set(BENCHMARK_INSTALL_DOCS       OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googlebenchmark)
 
+# ---- Boost.Asio (system dependency; see README "Building") ------------------
+# Not FetchContent-managed like GTest/Benchmark: Boost is too large to
+# reasonably build from source on every configure. Install via
+# `brew install boost` (macOS) or your distro's package manager first.
+# CONFIG mode is required: CMake 4.x removed the bundled FindBoost module, so
+# this relies on the BoostConfig.cmake that Boost's own install ships.
+find_package(Boost 1.74 REQUIRED CONFIG)
+
 # ---- Core library -----------------------------------------------------------
 # All modules link against chronos_lib; this avoids recompiling shared code
 # for the main executable, tests, and benchmarks.
@@ -46,6 +54,8 @@ add_library(chronos_lib STATIC
     src/simulation/sync_exchange.cpp
     src/simulation/causal_linker.cpp
     src/network/latency_model.cpp
+    src/network/virtual_scheduler.cpp
+    src/network/async_collector.cpp
     src/metrics/accuracy.cpp
     src/metrics/percentile.cpp
     src/metrics/ambiguity.cpp
@@ -53,6 +63,8 @@ add_library(chronos_lib STATIC
     src/timeline/causal_constraints.cpp
 )
 target_include_directories(chronos_lib PUBLIC include)
+target_link_libraries(chronos_lib PUBLIC Boost::headers)
+target_compile_definitions(chronos_lib PUBLIC BOOST_ASIO_NO_DEPRECATED)
 
 # ---- Main executable --------------------------------------------------------
 add_executable(chronos src/main.cpp)
@@ -75,6 +87,8 @@ add_executable(chronos_tests
     tests/causal_linker_test.cpp
     tests/causal_graph_test.cpp
     tests/causal_constraints_test.cpp
+    tests/virtual_scheduler_test.cpp
+    tests/async_collector_test.cpp
 )
 target_link_libraries(chronos_tests PRIVATE
     chronos_lib

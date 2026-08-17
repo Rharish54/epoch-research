@@ -1,0 +1,80 @@
+Async delivery: 20000 events in 3 ms
+
+Chronos Phase 6 — Simulation Report
+-------------------------------------
+Sources:                 1
+Events generated:        20000
+Seed:                    42
+Drift (PPM):             ±300
+Max offset (us):         ±2000
+Noise std (ns):          50
+Sync interval (us):      200
+Base latency (us):       100
+Drift window (samples):  10
+Outlier RTT multiplier:  3
+Causal chain fraction:   0.3
+Reorder probability:     0
+
+Raw timestamp ordering accuracy:      100.00%
+  (sampled 1999910 of 199990000 pairs -- exact computation would be O(n^2))
+Naive-corrected ordering accuracy:    100.00%
+  (sampled 1999910 of 199990000 pairs -- exact computation would be O(n^2))
+Weighted-corrected ordering accuracy: 100.00%
+  (sampled 1999910 of 199990000 pairs -- exact computation would be O(n^2))
+Arrival-order (receive_time) accuracy:99.97%
+  (sampled 1999910 of 199990000 pairs -- exact computation would be O(n^2))
+Improvement (raw -> naive):            -0.00 pp
+Improvement (naive -> weighted):       0.00 pp
+
+Naive correction error    -- median / p95 / p99: 23442.00 / 65908.00 / 87185.00 ns
+Weighted correction error -- median / p95 / p99: 13720.00 / 39518.00 / 49221.00 ns
+
+
+Confidence-interval classification (weighted-corrected events):
+  Definite pairs:   1995801 (99.79%), correct: 1995801 (100.00%)
+  Ambiguous pairs:  4109 (0.21%)
+  Point-estimate errors: 8, caught by ambiguity flag: 8 (100.00%)
+  (sampled 1999910 of 199990000 pairs -- exact computation would be O(n^2))
+
+Causal graph: 0 chains, 0 events linked, 0 edges (20000 abandoned)
+  Ground-truth violations: 0 (should always be 0 -- an invariant of assign_causal_chains)
+  Raw timeline violations:       0 / 0 edges
+  Corrected-point violations:    0 / 0 edges
+  Corrected-interval violations: 0 / 0 edges
+
+Causal interval narrowing: 0 nodes narrowed, 0 inconsistent components (0 nodes reverted)
+Weighted + causal ordering accuracy:  100.00%
+  (sampled 1999910 of 199990000 pairs -- exact computation would be O(n^2))
+  Corrected-interval violations after narrowing: 0 / 0 edges (point check)
+
+Ambiguity before vs after causal narrowing (global, sampled pairs):
+  Ambiguous pairs: 4109 -> 4109
+  Definite pairs:  1995801 -> 1995801 (correct: 1995801 -> 1995801)
+
+Ambiguity on causally-related pairs only (exact, not sampled -- see README on why
+global sampling dilutes this signal):
+  Pairs evaluated: 0
+  Ambiguous: 0 -> 0
+  Definite:  0 -> 0 (correct: 0 -> 0)
+
+Async delivery (virtual-time Asio pipeline):
+  Events delivered:            20000 / 20000
+  Realized delivery latency -- median / p95 / p99: 99618.00 / 181788.00 / 215127.00 ns
+  Same-source arrival inversions: 14339 / 19999 adjacent pairs (71.70%)
+  Reorder probability:         0.00
+
+Sync samples: 1028 total, 0 rejected as RTT outliers (0.00%)
+Events corrected: 19991 naive (9 uncorrected), 19991 weighted (9 uncorrected)
+
+First 10 events by true order vs raw order:
+  Rank    SrcID      true_time (ns)     local_time (ns)   offset (ns)
+     0        0 1767225600000006761 1767225600000006757            -4
+     1        0 1767225600000022654 1767225600000022643           -11
+     2        0 1767225600000040822 1767225600000040835            13
+     3        0 1767225600000050735 1767225600000050759            24
+     4        0 1767225600000052776 1767225600000052752           -24
+     5        0 1767225600000055517 1767225600000055440           -77
+     6        0 1767225600000060872 1767225600000060869            -3
+     7        0 1767225600000066652 1767225600000066709            57
+     8        0 1767225600000068618 1767225600000068645            27
+     9        0 1767225600000073451 1767225600000073430           -21

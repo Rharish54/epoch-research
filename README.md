@@ -1,6 +1,19 @@
 # epoch-research
 C++20 distributed timeline reconstructor which corrects clock skew, drift, and network jitter across concurrent market-data sources to recover true event ordering.
 
+## Building
+
+Prerequisites: CMake 3.21+, a C++20 compiler, and [Boost](https://www.boost.org/) (used for Boost.Asio, Phase 6's async delivery pipeline). GoogleTest and Google Benchmark are fetched automatically via CMake `FetchContent` and need no separate install.
+
+```bash
+brew install boost   # macOS; use your distro's package manager on Linux
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)"
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
+
+`-DCMAKE_PREFIX_PATH="$(brew --prefix)"` is defensive (helps CMake find Boost's CMake config on Intel macOS or a non-default Homebrew prefix); it's usually unnecessary on Apple Silicon but harmless either way.
+
 ## Phase 3: Drift Estimation and Outlier Rejection
 
 Phase 2 introduced a naive offset estimator (`OffsetEstimator`) that just remembers the most recent sync sample. That's exact when a source's clock has zero drift, but real clocks drift over time, and any single sync sample also carries whatever network jitter happened to hit it at that moment.
@@ -174,3 +187,57 @@ Several honest observations, again not the ones a marketing-driven writeup would
 - **The corrected-interval check does its job in both regimes**: it is consistently the lowest violation count of the three timelines (337 vs. 482 corrected-point at baseline; 9 vs. 69 at wide spacing) — intervals hedge instead of confidently asserting a wrong order, exactly as designed.
 - **At default (tight) event spacing, narrowing mostly fails** — 62% of linked nodes end up in an inconsistent component and get reverted, versus only 1.7% at wide spacing. This is the failure mode flagged above, observed directly: the nearest-neighbor linker (by design) creates chains whose true gaps can be smaller than what a ~17-90us-wide heuristic interval can resolve, so a majority of chains are judged causally infeasible against their own timing intervals rather than successfully narrowed. **Wider event spacing is what makes interval narrowing actually work** — at 500us mean inter-event time, reverted nodes drop to 1.7% and the global "weighted + causal" ordering accuracy reaches 99.98%.
 - **The causally-related-pairs effect is small but consistently in the right direction** in every run: ambiguous pairs go down and correct-definite pairs go up after narrowing, never the reverse. It is a modest effect (562->550 ambiguous at baseline; 952->947 at wide spacing) because narrowing only ever touches the causally-linked minority of events (1499 of 5000) and, at default spacing, further limited by the high revert rate above.
+
+## Phase 6: Boost.Asio Async Pipeline
+
+Phases 1-5 are entirely synchronous: `EventSource::generate(n)` computes a whole source's events as pure math and returns them as a batch; everything downstream operates on that static, fully-materialized list. `MarketEvent::receive_time` has existed since Phase 1 but, until now, got a naive one-line synchronous fill that nothing downstream read. Phase 6 replaces that fill with a real asynchronous delivery pipeline: multiple sources deliver events concurrently to one shared collector, through simulated network latency, with genuine reordering, built on Boost.Asio.
+
+### Design: virtual time, not real time
+
+A market-event simulator has no reason to wait in real time for simulated nanoseconds to elapse. `VirtualTimeScheduler` (`include/network/virtual_scheduler.hpp`) maintains a deterministic min-heap of pending actions ordered by `(simulated_fire_time, insertion_sequence)`; draining it pops the earliest action, posts it through a `boost::asio::io_context`, and runs exactly that one handler before moving to the next. Nothing ever sleeps — a run spanning a simulated day of activity and one spanning a simulated microsecond cost the same wall-clock time (however long it takes to drain the heap).
+
+This is deliberately honest about what Boost.Asio is doing here: `io_context` is the **executor** (a real handler-dispatch queue, and this project's required Boost.Asio integration), not the **clock** — the min-heap does the actual ordering. A bare loop popping the heap directly would be functionally identical to running one event through `io_context::post`+`run()`; Asio earns its place by providing the real async programming model, not by adding capability the heap doesn't already have.
+
+### Architecture
+
+`AsyncCollector` (`include/network/async_collector.hpp`) borrows the pooled event vector via `std::span` and stamps `receive_time` in place as arrivals are dispatched. `schedule_source_delivery` schedules one source's already-generated events: it draws a one-way latency for every event in the slice *up front*, then schedules each arrival at `event.true_time + delay`. Departure time is `true_time` (when the event actually happened), not `source_local_time` (the source's distorted belief about when) — physics must not be steered by a clock's reporting error.
+
+**One shared scheduler and collector across all sources** is the entire point of doing this asynchronously: cross-source interleaving on a single collector is exactly what per-source-isolated delivery could never produce.
+
+### Determinism
+
+Arrival order is a pure function of `(fire_time, insertion_sequence)`, where the sequence is assigned in ascending source order, then generation order within a source — no `unordered_map` iteration, no pointer values, no wall clock anywhere in the ordering path. `io_context` is constructed with concurrency hint 1 and is only ever driven by one thread, so Asio itself contributes zero ordering nondeterminism.
+
+**No new RNG seed stream was needed.** Delivery latency reuses the exact per-source seed stream (`cfg.seed * kEventLatencySeedMul + s`) the old synchronous fill used, consumed in the same order. This gives a strong, directly-verified migration guarantee: at `--reorder-probability 0`, **every metric in a Phase 6 run is bit-identical to the Phase 5 baseline** — confirmed by diffing a fresh run against `results/phase5_baseline.txt` with the async-specific lines filtered out; the diff is empty.
+
+### Measured results
+
+All runs: seed 42, 16 sources, 5000 events (same config as prior baselines unless noted).
+
+**Baseline** (`results/phase6_baseline.txt`):
+
+| Metric | Value |
+|---|---|
+| Events delivered | 5000 / 5000 |
+| Realized delivery latency median / p95 / p99 | 100,753 / 183,039 / 219,493 ns |
+| Same-source arrival inversions | 3587 / 4984 adjacent pairs (71.97%) |
+| Arrival-order (`receive_time`) ordering accuracy | 98.24% |
+| Raw timestamp ordering accuracy (unchanged from Phase 3-5) | 71.36% |
+
+Arrival-order accuracy (98.24%) sits far above raw-local accuracy (71.36%) for an intuitive reason: `receive_time` is stamped by one collector clock, immune to the per-source clock skew that makes `source_local_time` unreliable — its only failure mode is network latency jitter, a much smaller source of error than multi-microsecond clock offsets.
+
+**Source-count sweep** (`results/phase6_sources_{1,4,16,64}.txt`, 20,000 events each):
+
+| Sources | Wall-clock delivery time |
+|---|---|
+| 1 | 3 ms |
+| 4 | 3 ms |
+| 16 | 3 ms |
+| 64 | 3 ms |
+
+Flat across source count, exactly as the virtual-time design predicts: wall-clock cost is a function of event count (heap operations), not source count or simulated time span.
+
+**Honest findings, not the ones a marketing-driven writeup would lead with:**
+
+- **Realized delivery latency matches `LatencyModel`'s synchronous draw distribution exactly**, because the collector has unbounded capacity and virtual time adds no queueing delay. The async layer changes *ordering and interleaving*, not the latency distribution — adding a queueing/service-time model would change that, and is deliberately out of scope here.
+- **`apply_reordering`'s effect on the aggregate same-source-inversion count is small and inconsistent in direction, not a clean "more reordering" signal.** Comparing `results/phase6_baseline.txt` (`--reorder-probability 0`, 3587 inversions) against `results/phase6_reorder.txt` (`--reorder-probability 0.3`, 3585 inversions) shows essentially no aggregate change; a moderate-jitter comparison (`--jitter-us 5`) showed a small *decrease* (1152 -> 1128) enabling reordering. This is because `apply_reordering` swaps adjacent-pair *values* in an already-i.i.d.-jitter-drawn delay sequence — the multiset of realized latencies is provably unchanged either way (see `ReorderingPermutesLatencyPairingsOnlyNotTheMultiset`), so its effect on any aggregate statistic over that multiset is genuinely small and can move in either direction depending on which specific pairs happen to get swapped. With jitter off entirely, every delay value is identical, so swapping identical values is a mathematical no-op on delivery order regardless of `reorder_probability` — verified directly (`--jitter-us 0` gives 0 same-source inversions at both `--reorder-probability 0` and `1`). The primitive's integration and correctness are proven directly at the individual-event level instead (`ApplyReorderingSwapsExpectedDelayPairingIntoRealReceiveTimes` hand-computes the exact expected post-swap `receive_time` and asserts the real pipeline matches it exactly) — that is the right level to verify this mechanism at, not an aggregate CLI statistic that a symmetric pairwise swap of already-random values isn't well-suited to move.
