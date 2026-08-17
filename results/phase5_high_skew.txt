@@ -1,0 +1,72 @@
+
+Chronos Phase 5 — Simulation Report
+-------------------------------------
+Sources:                 16
+Events generated:        5000
+Seed:                    42
+Drift (PPM):             ±300
+Max offset (us):         ±5000
+Noise std (ns):          50
+Sync interval (us):      200
+Base latency (us):       100
+Drift window (samples):  10
+Outlier RTT multiplier:  3
+Causal chain fraction:   0.3
+
+Raw timestamp ordering accuracy:      97.83%
+  (sampled 1999596 of 12497500 pairs -- exact computation would be O(n^2))
+Naive-corrected ordering accuracy:    99.96%
+  (sampled 1999596 of 12497500 pairs -- exact computation would be O(n^2))
+Weighted-corrected ordering accuracy: 99.97%
+  (sampled 1999596 of 12497500 pairs -- exact computation would be O(n^2))
+Improvement (raw -> naive):            2.12 pp
+Improvement (naive -> weighted):       0.01 pp
+
+Naive correction error    -- median / p95 / p99: 23833.00 / 67981.00 / 86342.00 ns
+Weighted correction error -- median / p95 / p99: 14190.00 / 40246.00 / 53095.00 ns
+
+
+Confidence-interval classification (weighted-corrected events):
+  Definite pairs:   1994409 (99.74%), correct: 1993990 (99.98%)
+  Ambiguous pairs:  5187 (0.26%)
+  Point-estimate errors: 696, caught by ambiguity flag: 277 (39.80%)
+  (sampled 1999596 of 12497500 pairs -- exact computation would be O(n^2))
+
+Causal graph: 502 chains, 1499 events linked, 997 edges (0 abandoned)
+  Ground-truth violations: 0 (should always be 0 -- an invariant of assign_causal_chains)
+  Raw timeline violations:       486 / 997 edges
+  Corrected-point violations:    77 / 997 edges
+  Corrected-interval violations: 34 / 997 edges
+  Example impossible-timeline edge (raw-timeline parent -> child, local_time ns):
+    parent event 4064 local=1767225600003864019  ->  child event 0 local=1767225599995338193
+
+Causal interval narrowing: 93 nodes narrowed, 29 inconsistent components (93 nodes reverted)
+Weighted + causal ordering accuracy:  99.97%
+  (sampled 1999596 of 12497500 pairs -- exact computation would be O(n^2))
+  Corrected-interval violations after narrowing: 77 / 997 edges (point check)
+
+Ambiguity before vs after causal narrowing (global, sampled pairs):
+  Ambiguous pairs: 5187 -> 5174
+  Definite pairs:  1994409 -> 1994422 (correct: 1993990 -> 1994003)
+
+Ambiguity on causally-related pairs only (exact, not sampled -- see README on why
+global sampling dilutes this signal):
+  Pairs evaluated: 1650
+  Ambiguous: 907 -> 902
+  Definite:  743 -> 748 (correct: 689 -> 694)
+
+Sync samples: 13237 total, 0 rejected as RTT outliers (0.00%)
+Events corrected: 4946 naive (54 uncorrected), 4946 weighted (54 uncorrected)
+
+First 10 events by true order vs raw order:
+  Rank    SrcID      true_time (ns)     local_time (ns)   offset (ns)
+     0       13 1767225600000197395 1767225600003864019       3666624
+     1        3 1767225600000219561 1767225599997219512      -3000049
+     2       15 1767225600000307855 1767225600005307840       4999985
+     3        0 1767225600000338098 1767225599995338193      -4999905
+     4        5 1767225600000382701 1767225599998715821      -1666880
+     5       11 1767225600000391594 1767225600002724753       2333159
+     6        4 1767225600000423981 1767225599998090874      -2333107
+     7        2 1767225600000448221 1767225599996781734      -3666487
+     8        7 1767225600000455352 1767225600000121776       -333576
+     9        2 1767225600000496419 1767225599996829868      -3666551

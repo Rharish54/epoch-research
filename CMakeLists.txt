@@ -44,10 +44,13 @@ add_library(chronos_lib STATIC
     src/clock/drift_estimator.cpp
     src/simulation/event_source.cpp
     src/simulation/sync_exchange.cpp
+    src/simulation/causal_linker.cpp
     src/network/latency_model.cpp
     src/metrics/accuracy.cpp
     src/metrics/percentile.cpp
     src/metrics/ambiguity.cpp
+    src/timeline/causal_graph.cpp
+    src/timeline/causal_constraints.cpp
 )
 target_include_directories(chronos_lib PUBLIC include)
 
@@ -69,6 +72,9 @@ add_executable(chronos_tests
     tests/percentile_test.cpp
     tests/interval_order_test.cpp
     tests/ambiguity_test.cpp
+    tests/causal_linker_test.cpp
+    tests/causal_graph_test.cpp
+    tests/causal_constraints_test.cpp
 )
 target_link_libraries(chronos_tests PRIVATE
     chronos_lib

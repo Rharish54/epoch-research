@@ -100,3 +100,77 @@ Two honest observations from these numbers, not the ones a marketing-driven writ
 
 - **Definite-pair accuracy (~92%) sits close to overall weighted-corrected accuracy (92.46%, from Phase 3), not near 100%.** The reason is pair *sampling*, not a flaw in the interval logic: `classify_pairs` samples uniformly at random over all 5000 events spanning the full run duration, so most sampled pairs are events far apart in time — trivially separable regardless of estimator uncertainty, and rarely where errors occur. The interval logic's real value concentrates on temporally *close* pairs, which uniform-random sampling underrepresents. A pair-sampling strategy biased toward nearby events (or an explicit "adjacent-in-corrected-order" evaluation) would show a sharper effect; that's a natural follow-up rather than something implemented here.
 - **The direction is still correct and moves as expected**: raising noise/jitter/spikes widens uncertainty intervals, which raises both the ambiguous-pair fraction (8.19% -> 8.75%) and the fraction of point-estimate errors correctly caught as ambiguous (8.71% -> 11.12%) — the interval logic is doing more hedging exactly when the underlying estimate is less trustworthy, which is the property it's supposed to have.
+
+## Phase 5: Causal Graph
+
+Phase 4 gives every event a defensible uncertainty interval, but timing evidence alone has a floor: when two intervals overlap, the pair is ambiguous even if we *know* the order from protocol semantics — an order cannot be acknowledged before it is submitted. Phase 5 adds that second, independent source of evidence: cross-source causal chains (`OrderSubmitted -> OrderAcknowledged -> OrderExecuted -> TradePublished`), a directed graph over them, violation detection against three different timeline representations, and interval narrowing that propagates causal constraints back into the Phase 4 bounds.
+
+### Causal chain generation
+
+`assign_causal_chains` (`include/simulation/causal_linker.hpp`) runs as a post-generation pass over the pooled event list. It walks events in `(true_time, event_id)` order and, at a configurable target rate (`--causal-chain-fraction`, default 0.3), links each chain to the temporally *nearest* eligible event on a *different* source. It mutates only `event_type` and `parent_event_id` — **never a timestamp** — which is a hard correctness requirement: every Phase 3/4 metric is a function of timestamps alone, so causal linking must not perturb any of them. This is enforced by a dedicated test (`TimestampsAreUnmodifiedByLinking`) and verified end-to-end: `results/phase5_baseline.txt` (linking on) and a `--causal-chain-fraction 0.0` run reproduce the exact Phase 3/4 numbers in `results/phase4_baseline.txt`, character-for-character.
+
+By construction, every assigned edge satisfies `parent.true_time < child.true_time` and `parent.source_id != child.source_id` — ground truth is causally consistent by construction, and any violation observed later is entirely an artifact of clock skew, which is the effect Phase 5 is built to expose.
+
+**Design tradeoff**: linking to the *nearest* eligible cross-source successor (rather than a random or far-apart one) maximizes how often clock skew alone is enough to make a chain look causally impossible in the raw timeline — the true gap between chain members can be as small as the mean inter-event time. This is deliberate for demonstrating the headline "impossible timeline" effect, but it has a real cost documented below: it also produces chains whose true gaps are smaller than what the Phase 4 uncertainty intervals can reliably resolve.
+
+### Causal graph and violation detection
+
+`CausalGraph` (`include/timeline/causal_graph.hpp`) builds an index-addressed DAG from `parent_event_id` links (Kahn's algorithm for topological sort; cycle detection guards against hand-built/corrupt input, since the linker's forest structure can never produce one). Three distinct violation checks exist for three timeline representations:
+
+| Timeline | Edge parent->child is violated when |
+|---|---|
+| Raw (`source_local_time`) | `child < parent` |
+| Corrected point estimate | `child < parent` |
+| Corrected **interval** | `child.upper_bound <= parent.lower_bound` (no feasible assignment satisfies `parent < child`) |
+
+The interval check uses `<=`, not the strict `<` that Phase 4's `classify_order` uses for its Before/After split — a shared boundary point means the only feasible assignment is `parent == child`, which still violates strict causal precedence, even though `classify_order` calls it Ambiguous. This is a deliberate, tested divergence between the two checks (`TouchingIntervalsAreAViolationEvenThoughClassifyOrderCallsThemAmbiguous`).
+
+### Interval narrowing
+
+`narrow_intervals` (`include/timeline/causal_constraints.hpp`) tightens `CorrectedEvent` bounds via arc consistency on the "parent strictly before child" constraint: a forward pass in topological order lifts each child's lower bound above its parent's (`child.lower = max(child.lower, parent.lower + 1ns)`), then a reverse pass lowers each parent's upper bound below its child's. **Soundness**: if every input interval already contains its true time, narrowing can never push a bound past that true time (by induction over the topological order, using the ground-truth guarantee `parent.true_time < child.true_time`), so a correct interval cannot be made incorrect by narrowing alone.
+
+That soundness argument has a load-bearing premise that does not always hold: Phase 4's uncertainty is a heuristic bound (`max(RTT/2, fit residual RMS)`), not a coverage-guaranteed confidence interval — the measured 92.51% definite-pair accuracy (Phase 4) already proves a material share of intervals miss their true time. When that happens, narrowing propagates the error along the chain, and a set of causal constraints plus timing intervals can become **jointly infeasible** — a node's narrowed lower bound exceeds its narrowed upper bound. Rather than emit an inverted or empty interval (which would make `classify_order` report a confident wrong answer), every node in that node's connected component is reverted to its pre-narrowing bounds and excluded from any "narrowed" claim. This is measured, not assumed away — see the results below, where it turns out to matter a great deal.
+
+### Measured results
+
+All runs: seed 42, 16 sources, 5000 events, `--causal-chain-fraction 0.3` (502 chains, 1499 events linked, 997 edges in every run below — chain structure depends only on `true_time`/`source_id`/`seed`, none of which change across these experiments).
+
+**Baseline** (`results/phase5_baseline.txt`, same config as the Phase 3/4 baseline: 10us mean inter-event time, ±2000us max offset):
+
+| Metric | Value |
+|---|---|
+| Raw timeline violations | 487 / 997 edges (48.8%) |
+| Corrected-point violations | 482 / 997 edges (48.3%) |
+| Corrected-interval violations | 337 / 997 edges (33.8%) |
+| Nodes narrowed | 202 |
+| Inconsistent components (nodes reverted) | 294 (935 of 1499 linked nodes — 62%) |
+| Causally-related pairs: ambiguous | 552 -> 550 |
+| Causally-related pairs: definite, correct | 1098, 564 -> 1100, 566 |
+
+**Wider event spacing** (`results/phase5_wide_spacing.txt`, `--inter-event-us 500`, everything else unchanged):
+
+| Metric | Value |
+|---|---|
+| Raw timeline violations | 478 / 997 edges (47.9%) |
+| Corrected-point violations | 69 / 997 edges (6.9%) |
+| Corrected-interval violations | 9 / 997 edges (0.9%) |
+| Nodes narrowed | 149 |
+| Inconsistent components (nodes reverted) | 8 (25 of 1499 — 1.7%) |
+| Weighted + causal ordering accuracy | 99.98% |
+| Causally-related pairs: ambiguous | 952 -> 947 |
+| Causally-related pairs: definite, correct | 698, 686 -> 703, 691 |
+
+**Higher skew** (`results/phase5_high_skew.txt`, wide spacing + `--max-offset-us 5000`):
+
+| Metric | Value |
+|---|---|
+| Raw timeline violations | 486 / 997 edges (48.7%) |
+| Corrected-point violations | 77 / 997 edges (7.7%) |
+| Corrected-interval violations | 34 / 997 edges (3.4%) |
+
+Several honest observations, again not the ones a marketing-driven writeup would lead with:
+
+- **Raw-timeline violations sit around 48% almost regardless of skew magnitude, because the linker already links to the temporally nearest cross-source event.** Going from ±2000us to ±5000us max offset barely moves the raw violation rate (48.8% -> 48.7% at wide spacing, 47.9% -> 48.7%). The nearest-neighbor linking design (documented above) already saturates the effect at moderate skew — most linked pairs' true gaps are already smaller than the clock offset spread, so adding more skew doesn't create meaningfully more violations. This is a real finding about the experiment design, not a defect in causality detection.
+- **The corrected-interval check does its job in both regimes**: it is consistently the lowest violation count of the three timelines (337 vs. 482 corrected-point at baseline; 9 vs. 69 at wide spacing) — intervals hedge instead of confidently asserting a wrong order, exactly as designed.
+- **At default (tight) event spacing, narrowing mostly fails** — 62% of linked nodes end up in an inconsistent component and get reverted, versus only 1.7% at wide spacing. This is the failure mode flagged above, observed directly: the nearest-neighbor linker (by design) creates chains whose true gaps can be smaller than what a ~17-90us-wide heuristic interval can resolve, so a majority of chains are judged causally infeasible against their own timing intervals rather than successfully narrowed. **Wider event spacing is what makes interval narrowing actually work** — at 500us mean inter-event time, reverted nodes drop to 1.7% and the global "weighted + causal" ordering accuracy reaches 99.98%.
+- **The causally-related-pairs effect is small but consistently in the right direction** in every run: ambiguous pairs go down and correct-definite pairs go up after narrowing, never the reverse. It is a modest effect (562->550 ambiguous at baseline; 952->947 at wide spacing) because narrowing only ever touches the causally-linked minority of events (1499 of 5000) and, at default spacing, further limited by the high revert rate above.

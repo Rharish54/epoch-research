@@ -4,8 +4,11 @@
 #include "metrics/ambiguity.hpp"
 #include "metrics/percentile.hpp"
 #include "network/latency_model.hpp"
+#include "simulation/causal_linker.hpp"
 #include "simulation/event_source.hpp"
 #include "simulation/sync_exchange.hpp"
+#include "timeline/causal_constraints.hpp"
+#include "timeline/causal_graph.hpp"
 #include "timeline/corrected_event.hpp"
 
 #include <algorithm>
@@ -40,6 +43,7 @@ struct SimConfig {
     double      spike_multiplier    = 10.0;    // spike latency = (base+jitter) * multiplier
     int         drift_window        = 10;      // samples retained by the weighted drift estimator
     double      outlier_rtt_multiplier = 3.0;  // reject sync samples with RTT > multiplier * rolling median
+    double      causal_chain_fraction = 0.3;   // target fraction of events enlisted into causal chains
     std::string output_path;                   // empty = stdout only
 };
 
@@ -60,6 +64,7 @@ void print_usage(const char* prog) {
               << "  --spike-multiplier F     spike latency multiplier     (default 10.0)\n"
               << "  --drift-window N         samples in weighted drift fit (default 10)\n"
               << "  --outlier-rtt-multiplier F reject RTT > multiplier * rolling median (default 3.0)\n"
+              << "  --causal-chain-fraction F target fraction of events in causal chains (default 0.3)\n"
               << "  --output PATH            write events CSV to PATH\n";
 }
 
@@ -128,6 +133,8 @@ SimConfig parse_args(int argc, char** argv) {
             cfg.drift_window = parse_or_exit<int>(key, next(), [](const std::string& s) { return std::stoi(s); });
         } else if (key == "--outlier-rtt-multiplier") {
             cfg.outlier_rtt_multiplier = dbl();
+        } else if (key == "--causal-chain-fraction") {
+            cfg.causal_chain_fraction = dbl();
         } else if (key == "--output") {
             cfg.output_path = std::string(next());
         } else if (key == "--help" || key == "-h") {
@@ -184,6 +191,10 @@ SimConfig parse_args(int argc, char** argv) {
         std::cerr << "--outlier-rtt-multiplier must be positive\n";
         std::exit(1);
     }
+    if (cfg.causal_chain_fraction < 0.0 || cfg.causal_chain_fraction > 1.0) {
+        std::cerr << "--causal-chain-fraction must be within [0, 1]\n";
+        std::exit(1);
+    }
     return cfg;
 }
 
@@ -207,6 +218,7 @@ constexpr std::uint64_t kClockSeedMul         = 6364136223846793005ULL;
 constexpr std::uint64_t kEventGapSeedMul      = 2862933555777941757ULL;
 constexpr std::uint64_t kSyncLatencySeedMul   = 0xBF58476D1CE4E5B9ULL;
 constexpr std::uint64_t kEventLatencySeedMul  = 0x94D049BB133111EBULL;
+constexpr std::uint64_t kCausalLinkSeedMul    = 0xD6E8FEB86659FD93ULL;
 
 } // namespace
 
@@ -348,6 +360,18 @@ int main(int argc, char** argv) {
         for (auto& e : evts) all_events.push_back(std::move(e));
     }
 
+    // Phase 5: assign cross-source causal chains over the pooled event
+    // list. This mutates only event_type/parent_event_id, never a
+    // timestamp -- every metric below is a function of timestamps alone,
+    // so this call cannot perturb the Phase 3/4 numbers (verified in
+    // results/phase5_baseline.txt against results/phase4_baseline.txt).
+    const auto causal_link_stats = chronos::assign_causal_chains(
+        all_events,
+        chronos::CausalLinkConfig{
+            .chain_fraction = cfg.causal_chain_fraction,
+            .seed           = cfg.seed * kCausalLinkSeedMul,
+        });
+
     // Correction pass + accuracy measurement. Both use one canonical event
     // ordering -- sorted by source_local_time, matching Phase 1's raw-timeline
     // ordering exactly -- so raw and corrected accuracy sample identical
@@ -432,6 +456,32 @@ int main(int argc, char** argv) {
     const chronos::AmbiguityResult ambiguity_result =
         chronos::classify_pairs(corrected_events, cfg.seed);
 
+    // Phase 5: causal graph, violation detection, and interval narrowing.
+    // `corrected_events` (and the parallel true_times/raw_times/weighted_times
+    // vectors) share one index space, built in the same loop above, so the
+    // graph and every check below index consistently across all of them.
+    const chronos::CausalGraph causal_graph = chronos::CausalGraph::build(corrected_events);
+
+    const auto ground_truth_violations = chronos::check_point_violations(causal_graph, true_times);
+    const auto raw_violations          = chronos::check_point_violations(causal_graph, raw_times);
+    const auto corrected_violations    = chronos::check_point_violations(causal_graph, weighted_times);
+    const auto interval_violations     = chronos::check_interval_violations(causal_graph, corrected_events);
+
+    std::vector<chronos::CorrectedEvent> narrowed_events = corrected_events;
+    const auto narrowing_result = chronos::narrow_intervals(causal_graph, narrowed_events);
+
+    std::vector<chronos::NsTimestamp> narrowed_times;
+    narrowed_times.reserve(narrowed_events.size());
+    for (const auto& e : narrowed_events) narrowed_times.push_back(e.corrected_time);
+    const auto narrowed_corrected_violations = chronos::check_point_violations(causal_graph, narrowed_times);
+
+    const chronos::AccuracyResult narrowed_result =
+        chronos::pairwise_ordering_accuracy(true_times, narrowed_times, cfg.seed);
+    const chronos::AmbiguityResult narrowed_ambiguity_result =
+        chronos::classify_pairs(narrowed_events, cfg.seed);
+    const chronos::CausalPairResult causal_pair_result =
+        chronos::evaluate_causal_pairs(causal_graph, corrected_events, narrowed_events);
+
     // Ground-truth order, for the display table and CSV below.
     std::vector<chronos::MarketEvent> true_sorted = all_events;
     std::sort(true_sorted.begin(), true_sorted.end(),
@@ -440,7 +490,7 @@ int main(int argc, char** argv) {
               });
 
     // Print report.
-    std::cout << "\nChronos Phase 4 — Simulation Report\n";
+    std::cout << "\nChronos Phase 5 — Simulation Report\n";
     std::cout << "-------------------------------------\n";
     std::cout << "Sources:                 " << cfg.num_sources   << "\n";
     std::cout << "Events generated:        " << all_events.size() << "\n";
@@ -452,6 +502,7 @@ int main(int argc, char** argv) {
     std::cout << "Base latency (us):       " << cfg.base_latency_us  << "\n";
     std::cout << "Drift window (samples):  " << cfg.drift_window  << "\n";
     std::cout << "Outlier RTT multiplier:  " << cfg.outlier_rtt_multiplier << "\n";
+    std::cout << "Causal chain fraction:   " << cfg.causal_chain_fraction  << "\n";
     std::cout << "\n";
     std::cout << std::fixed << std::setprecision(2);
 
@@ -507,6 +558,53 @@ int main(int argc, char** argv) {
                    << ambiguity_result.total_pairs << " pairs -- exact computation would be O(n^2))\n";
     }
     std::cout << "\n";
+    std::cout << "Causal graph: " << causal_link_stats.chains_created << " chains, "
+               << causal_link_stats.events_linked << " events linked, " << causal_graph.edges().size()
+               << " edges (" << causal_link_stats.abandoned_chains << " abandoned)\n";
+    std::cout << "  Ground-truth violations: " << ground_truth_violations.violations
+               << " (should always be 0 -- an invariant of assign_causal_chains)\n";
+    std::cout << "  Raw timeline violations:       " << raw_violations.violations << " / "
+               << raw_violations.edges_checked << " edges\n";
+    std::cout << "  Corrected-point violations:    " << corrected_violations.violations << " / "
+               << corrected_violations.edges_checked << " edges\n";
+    std::cout << "  Corrected-interval violations: " << interval_violations.violations << " / "
+               << interval_violations.edges_checked << " edges\n";
+    if (!interval_violations.examples.empty()) {
+        std::cout << "  Example impossible-timeline edge (raw-timeline parent -> child, local_time ns):\n";
+        const auto& ex = interval_violations.examples.front();
+        std::cout << "    parent event " << static_cast<std::uint64_t>(corrected_events[ex.parent].original.event_id)
+                   << " local=" << corrected_events[ex.parent].original.source_local_time
+                   << "  ->  child event " << static_cast<std::uint64_t>(corrected_events[ex.child].original.event_id)
+                   << " local=" << corrected_events[ex.child].original.source_local_time << "\n";
+    }
+    std::cout << "\n";
+    if (narrowing_result) {
+        std::cout << "Causal interval narrowing: " << narrowing_result->nodes_narrowed << " nodes narrowed, "
+                   << narrowing_result->inconsistent_components << " inconsistent components ("
+                   << narrowing_result->nodes_reverted << " nodes reverted)\n";
+        print_accuracy("Weighted + causal ordering accuracy:  ", narrowed_result);
+        std::cout << "  Corrected-interval violations after narrowing: " << narrowed_corrected_violations.violations
+                   << " / " << narrowed_corrected_violations.edges_checked << " edges (point check)\n";
+        std::cout << "\n";
+        std::cout << "Ambiguity before vs after causal narrowing (global, sampled pairs):\n";
+        std::cout << "  Ambiguous pairs: " << ambiguity_result.ambiguous_pairs << " -> "
+                   << narrowed_ambiguity_result.ambiguous_pairs << "\n";
+        std::cout << "  Definite pairs:  " << ambiguity_result.definite_pairs << " -> "
+                   << narrowed_ambiguity_result.definite_pairs << " (correct: " << ambiguity_result.definite_correct
+                   << " -> " << narrowed_ambiguity_result.definite_correct << ")\n";
+        std::cout << "\n";
+        std::cout << "Ambiguity on causally-related pairs only (exact, not sampled -- see README on why\n";
+        std::cout << "global sampling dilutes this signal):\n";
+        std::cout << "  Pairs evaluated: " << causal_pair_result.pairs << "\n";
+        std::cout << "  Ambiguous: " << causal_pair_result.ambiguous_before << " -> "
+                   << causal_pair_result.ambiguous_after << "\n";
+        std::cout << "  Definite:  " << causal_pair_result.definite_before << " -> "
+                   << causal_pair_result.definite_after << " (correct: " << causal_pair_result.definite_correct_before
+                   << " -> " << causal_pair_result.definite_correct_after << ")\n";
+    } else {
+        std::cout << "Causal interval narrowing: skipped (graph contains a cycle)\n";
+    }
+    std::cout << "\n";
     std::cout << "Sync samples: " << total_sync_samples << " total, " << total_rejected
                << " rejected as RTT outliers ("
                << (total_sync_samples > 0 ? 100.0 * static_cast<double>(total_rejected) / static_cast<double>(total_sync_samples) : 0.0)
@@ -539,14 +637,16 @@ int main(int argc, char** argv) {
             std::cerr << "Could not open output file: " << cfg.output_path << "\n";
             return 1;
         }
-        out << "event_id,source_id,event_type,true_time_ns,local_time_ns,offset_ns\n";
+        out << "event_id,source_id,event_type,true_time_ns,local_time_ns,offset_ns,parent_event_id\n";
         for (const auto& e : true_sorted) {
             out << static_cast<std::uint64_t>(e.event_id)   << ","
                 << static_cast<std::uint32_t>(e.source_id)  << ","
                 << event_type_name(e.event_type)             << ","
                 << e.true_time                               << ","
                 << e.source_local_time                       << ","
-                << (e.source_local_time - e.true_time)       << "\n";
+                << (e.source_local_time - e.true_time)       << ",";
+            if (e.parent_event_id) out << static_cast<std::uint64_t>(*e.parent_event_id);
+            out << "\n";
         }
         std::cout << "\nEvents written to: " << cfg.output_path << "\n";
     }
